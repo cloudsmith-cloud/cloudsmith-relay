@@ -19,7 +19,7 @@ public sealed class StubPSRemoteExecutor : IPSRemoteExecutor
         string script,
         IDictionary<string, object>? args,
         CancellationToken ct) =>
-        Task.FromResult(new PSResult([], [], Success: false));
+        Task.FromResult(new PSResult(Success: false, Output: [], ErrorRecord: null, Elapsed: TimeSpan.Zero));
 
     public Task<IReadOnlyList<VmSnapshot>> GetInventoryAsync(
         string hostId,

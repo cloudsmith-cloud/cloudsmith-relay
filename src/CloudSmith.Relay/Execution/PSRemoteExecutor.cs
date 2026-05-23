@@ -58,18 +58,27 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
                     cmd.AddParameter(kv.Key, kv.Value);
             }
 
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var results = ps.Invoke();
-            var output  = results.Select(o => o?.BaseObject).ToList();
-            var errors  = ps.Streams.Error.Select(e => e?.ToString() ?? string.Empty).ToList();
+            sw.Stop();
+
+            IReadOnlyList<object> output = results
+                .Select(o => o?.BaseObject ?? (object)string.Empty)
+                .ToList();
+            var firstError = ps.Streams.Error.FirstOrDefault()?.ToString();
 
             if (ps.HadErrors)
             {
                 _logger.LogWarning(
-                    "PSRemote {Host}: script produced {ErrorCount} error(s): {FirstError}",
-                    hostId, errors.Count, errors.FirstOrDefault());
+                    "PSRemote {Host}: script produced error(s): {FirstError}",
+                    hostId, firstError);
             }
 
-            return new PSResult(output, errors, !ps.HadErrors);
+            return new PSResult(
+                Success:     !ps.HadErrors,
+                Output:      output,
+                ErrorRecord: firstError,
+                Elapsed:     sw.Elapsed);
         }, ct);
     }
 
