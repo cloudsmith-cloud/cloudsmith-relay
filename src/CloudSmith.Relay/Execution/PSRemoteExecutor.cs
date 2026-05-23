@@ -178,7 +178,13 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
                 appName:      "/wsman",
                 shellUri:     "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
                 credential:   psCredential);
-            connInfo.AuthenticationMechanism = AuthenticationMechanism.Basic;
+            // Negotiate (NTLM over HTTP) is the right choice for workgroup /
+            // non-domain hosts when the Relay runs on Linux: PSWSMan refuses
+            // Basic over HTTP ("Basic authentication is not supported over HTTP
+            // on Unix") and we don't want to require certs in the LAN MVP
+            // (ADR-007 amendment 2026-05-23). Negotiate uses NTLM here because
+            // there is no Kerberos KDC reachable from a workgroup host.
+            connInfo.AuthenticationMechanism = AuthenticationMechanism.Negotiate;
         }
 
         connInfo.OperationTimeout    = 30_000; // 30 s
