@@ -11,39 +11,48 @@ using Microsoft.Extensions.Options;
 namespace CloudSmith.Relay.Workers;
 
 /// <summary>
-/// Periodic inventory scan worker (AB#1680).
+/// Periodic inventory scan worker (AB#1680 / AB#1665).
 ///
-/// Scan path (MVP — no Agent enrollment required):
+/// Scan path (Agent-first per ADR-007 2026-05-23 update):
 ///   1. Read <c>RELAY_HYPER_V_HOSTS</c> (comma-separated hostnames).
-///   2. For each host: call <see cref="IPSRemoteExecutor.GetInventoryAsync"/> via WinRM.
-///   3. Aggregate all VM snapshots into a single <see cref="InventoryPush"/> and
-///      send over the relay WebSocket to PaaS.
+///   2. For each host:
+///      a. Check <see cref="IAgentRegistry"/> — if an Agent is enrolled for this
+///         host, SKIP the PSRemote scan (the Agent will push inventory directly
+///         to the LAN listener).
+///      b. If no Agent enrolled, fall back to <see cref="IPSRemoteExecutor.GetInventoryAsync"/>
+///         via WinRM (the pre-Agent fallback path per ADR-007).
+///   3. Aggregate all PSRemote-scanned VM snapshots into a single
+///      <see cref="InventoryPush"/> and send over the relay WebSocket to PaaS.
 ///
-/// When <c>RELAY_HYPER_V_HOSTS</c> is empty, the worker falls back to emitting
-/// an empty push (liveness heartbeat behaviour) so the Relay shows as "alive".
+/// When <c>RELAY_HYPER_V_HOSTS</c> is empty, the worker emits an empty push
+/// (liveness behaviour) so the Relay appears alive to PaaS.
 /// </summary>
 public sealed class InventoryScanWorker : BackgroundService
 {
     private readonly RelayOptions _opts;
     private readonly IRelayConnection _connection;
     private readonly IPSRemoteExecutor _psRemote;
+    private readonly IAgentRegistry _agentRegistry;
     private readonly ILogger<InventoryScanWorker> _logger;
 
     public InventoryScanWorker(
         IOptions<RelayOptions> opts,
         IRelayConnection connection,
         IPSRemoteExecutor psRemote,
+        IAgentRegistry agentRegistry,
         ILogger<InventoryScanWorker> logger)
     {
-        _opts       = opts.Value;
-        _connection = connection;
-        _psRemote   = psRemote;
-        _logger     = logger;
+        _opts          = opts.Value;
+        _connection    = connection;
+        _psRemote      = psRemote;
+        _agentRegistry = agentRegistry;
+        _logger        = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        _logger.LogInformation("InventoryScanWorker every {Interval} for cluster {ClusterId}; hosts={Hosts}",
+        _logger.LogInformation(
+            "InventoryScanWorker every {Interval} for cluster {ClusterId}; hosts={Hosts}",
             _opts.InventoryScanInterval, _opts.ClusterId,
             _opts.HyperVHosts.Count > 0 ? string.Join(",", _opts.HyperVHosts) : "(none configured)");
 
@@ -81,17 +90,30 @@ public sealed class InventoryScanWorker : BackgroundService
 
         if (_opts.HyperVHosts.Count == 0)
         {
-            _logger.LogInformation("Inventory scan: no RELAY_HYPER_V_HOSTS configured — pushing empty snapshot (liveness)");
+            _logger.LogInformation(
+                "Inventory scan: no RELAY_HYPER_V_HOSTS configured — pushing empty snapshot (liveness)");
         }
         else
         {
             foreach (var host in _opts.HyperVHosts)
             {
+                // Agent-first: if an Agent is already enrolled for this host, it pushes
+                // inventory directly to the LAN listener — no PSRemote scan needed here.
+                var agent = await _agentRegistry.GetAgentForHostAsync(host, ct).ConfigureAwait(false);
+                if (agent is not null)
+                {
+                    _logger.LogDebug(
+                        "Host {Host} has enrolled Agent {AgentId} — skipping PSRemote scan (Agent handles push)",
+                        host, agent.AgentId);
+                    continue;
+                }
+
+                // Fallback: PSRemote scan for hosts without an Agent.
                 try
                 {
                     var vms = await _psRemote.GetInventoryAsync(host, ct).ConfigureAwait(false);
                     allVms.AddRange(vms);
-                    _logger.LogInformation("Scanned host {Host}: {Count} VM(s)", host, vms.Count);
+                    _logger.LogInformation("PSRemote scan {Host}: {Count} VM(s)", host, vms.Count);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -99,16 +121,20 @@ public sealed class InventoryScanWorker : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Inventory scan failed for host {Host} — skipping", host);
+                    _logger.LogWarning(ex, "PSRemote inventory scan failed for host {Host} — skipping", host);
                 }
             }
         }
 
+        // Only push if we have PSRemote-sourced VMs (Agent-sourced ones are pushed live).
+        // Still push empty to maintain liveness heartbeat behaviour when all hosts have agents.
         try
         {
             var push = new InventoryPush(_opts.ClusterId, allVms);
             await _connection.SendAsync(push, ct).ConfigureAwait(false);
-            _logger.LogInformation("Inventory push sent: cluster={ClusterId} vms={Count}", _opts.ClusterId, allVms.Count);
+            _logger.LogInformation(
+                "Inventory push sent (PSRemote): cluster={ClusterId} vms={Count}",
+                _opts.ClusterId, allVms.Count);
         }
         catch (Exception ex)
         {

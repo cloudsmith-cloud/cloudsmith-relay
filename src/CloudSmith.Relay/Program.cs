@@ -5,12 +5,10 @@ using CloudSmith.Relay.Connection;
 using CloudSmith.Relay.Enrollment;
 using CloudSmith.Relay.Execution;
 using CloudSmith.Relay.Interfaces;
+using CloudSmith.Relay.Lan;
 using CloudSmith.Relay.State;
 using CloudSmith.Relay.Stubs;
 using CloudSmith.Relay.Workers;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Serilog;
 
@@ -22,34 +20,39 @@ var paasUrl = Environment.GetEnvironmentVariable("RELAY_PAAS_URL")
 var enrollmentToken = Environment.GetEnvironmentVariable("RELAY_ENROLLMENT_TOKEN");
 var displayName = Environment.GetEnvironmentVariable("RELAY_DISPLAY_NAME")
     ?? $"relay-{Environment.MachineName}";
-var listenPort = int.TryParse(
+var lanListenPort = int.TryParse(
     Environment.GetEnvironmentVariable("RELAY_LISTEN_PORT"),
-    out var port) ? port : 8443;
+    out var port) ? port : 8080;
 var identityDir = Environment.GetEnvironmentVariable("RELAY_IDENTITY_DIR")
     ?? RelayEnrollmentClient.DefaultIdentityDirectory;
 var clusterId = Environment.GetEnvironmentVariable("RELAY_CLUSTER_ID") ?? "demo";
 
+// RELAY_AGENT_ENROLLMENT_TOKEN — shared secret Agents must present during enroll.
+// Defaults to a random value so the Relay starts safely even if not set; Agents
+// must match whatever is configured here.
+var agentEnrollmentToken = Environment.GetEnvironmentVariable("RELAY_AGENT_ENROLLMENT_TOKEN")
+    ?? Guid.NewGuid().ToString("N");
+
 // RELAY_HYPER_V_HOSTS — comma-separated Hyper-V hostnames/IPs to scan directly
-// via WinRM when no Agent is enrolled. Empty = liveness-only mode.
+// via WinRM when no Agent is enrolled for that host.
 var hyperVHostsRaw = Environment.GetEnvironmentVariable("RELAY_HYPER_V_HOSTS") ?? string.Empty;
 var hyperVHosts = hyperVHostsRaw
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     .ToArray();
 
-// RELAY_PSREMOTE_USERNAME / RELAY_PSREMOTE_PASSWORD — local admin WinRM credential
-// for workgroup / not-yet-joined hosts. Not required for domain-joined (Kerberos).
+// RELAY_PSREMOTE_USERNAME / RELAY_PSREMOTE_PASSWORD — local admin WinRM credential.
 var psRemoteUsername = Environment.GetEnvironmentVariable("RELAY_PSREMOTE_USERNAME") ?? string.Empty;
 var psRemotePassword = Environment.GetEnvironmentVariable("RELAY_PSREMOTE_PASSWORD") ?? string.Empty;
 
 var relayOptions = new RelayOptions
 {
-    PaasUrl         = paasUrl,
-    EnrollmentToken = enrollmentToken,
-    DisplayName     = displayName,
-    ListenPort      = listenPort,
+    PaasUrl           = paasUrl,
+    EnrollmentToken   = enrollmentToken,
+    DisplayName       = displayName,
+    ListenPort        = lanListenPort,
     IdentityDirectory = identityDir,
-    ClusterId       = clusterId,
-    HyperVHosts     = hyperVHosts,
+    ClusterId         = clusterId,
+    HyperVHosts       = hyperVHosts,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,19 +66,34 @@ Log.Logger = new LoggerConfiguration()
 
 try
 {
-    var builder = Host.CreateApplicationBuilder(args);
+    // ---------------------------------------------------------------------------
+    // WebApplication builder — replaces Host.CreateApplicationBuilder so that
+    // the LAN listener (ASP.NET Core controllers) co-exists with the background
+    // services (outbound PaaS WebSocket, PSRemote scanner).
+    // ---------------------------------------------------------------------------
+    var builder = WebApplication.CreateBuilder(args);
     builder.Logging.ClearProviders();
     builder.Logging.AddSerilog(Log.Logger, dispose: true);
 
+    // Kestrel LAN listener — HTTP on port RELAY_LISTEN_PORT (default 8080).
+    // HTTPS (Phase V) will require cert provisioning; for MVP intra-LAN HTTP is acceptable.
+    builder.WebHost.UseKestrel(k =>
+    {
+        k.ListenAnyIP(lanListenPort);
+    });
+
+    builder.Services.AddControllers();
+
+    // ---------------------------------------------------------------------------
+    // Services shared with background workers.
+    // ---------------------------------------------------------------------------
     builder.Services.AddSingleton(Options.Create(relayOptions));
 
-    // HttpClient for enrollment.
     builder.Services.AddSingleton(_ => new HttpClient
     {
         Timeout = TimeSpan.FromSeconds(30),
     });
 
-    // Enrollment client.
     builder.Services.AddSingleton<IRelayEnrollmentClient>(sp =>
         new RelayEnrollmentClient(
             sp.GetRequiredService<HttpClient>(),
@@ -83,10 +101,6 @@ try
             relayOptions.PaasUrl,
             relayOptions.IdentityDirectory));
 
-    // Resolve RelayId from persisted identity (or "pending" — the hosted
-    // service runs enrollment first and the WebSocket loop attempts its first
-    // connect after that). For first-run we re-build options after enrollment;
-    // for steady-state the identity is on disk before DI runs.
     builder.Services.AddSingleton(sp =>
     {
         var enroller = sp.GetRequiredService<IRelayEnrollmentClient>();
@@ -98,23 +112,30 @@ try
         }
         return Options.Create(new RelayConnectionOptions
         {
-            PaasUrl = relayOptions.PaasUrl,
-            RelayId = relayId,
+            PaasUrl        = relayOptions.PaasUrl,
+            RelayId        = relayId,
             PrivateKeyPath = Path.Combine(relayOptions.IdentityDirectory, "relay.key"),
         });
     });
     builder.Services.AddSingleton<IRelayConnection, WebSocketRelayConnection>();
-
-    // Host state tracking.
     builder.Services.AddSingleton<IHostStateTracker, HostStateTracker>();
 
-    // Agent registry — in-memory stub until Agent enrollment sprint lands.
-    builder.Services.AddSingleton<IAgentRegistry, StubAgentRegistry>();
+    // ---------------------------------------------------------------------------
+    // Agent registry — real in-memory implementation backed by enrollment token.
+    // Registered as both the concrete type (for LanController injection) and the
+    // IAgentRegistry interface (for InventoryScanWorker lookup).
+    // ---------------------------------------------------------------------------
+    builder.Services.AddSingleton(sp =>
+        new InMemoryAgentRegistry(
+            agentEnrollmentToken,
+            sp.GetRequiredService<ILogger<InMemoryAgentRegistry>>()));
 
-    // PSRemote executor (AB#1680): use the real WSMan implementation when
-    // RELAY_PSREMOTE_USERNAME is set or when RELAY_HYPER_V_HOSTS lists hosts
-    // that are expected to be domain-joined (Kerberos, no creds needed).
-    // Fall back to no-op stub when neither is configured.
+    builder.Services.AddSingleton<IAgentRegistry>(sp =>
+        sp.GetRequiredService<InMemoryAgentRegistry>());
+
+    // ---------------------------------------------------------------------------
+    // PSRemote executor — real when RELAY_HYPER_V_HOSTS is set, stub otherwise.
+    // ---------------------------------------------------------------------------
     if (hyperVHosts.Length > 0)
     {
         builder.Services.AddSingleton(new PSRemoteCredential
@@ -129,12 +150,20 @@ try
         builder.Services.AddSingleton<IPSRemoteExecutor, StubPSRemoteExecutor>();
     }
 
+    // ---------------------------------------------------------------------------
     // Background services.
+    // ---------------------------------------------------------------------------
     builder.Services.AddHostedService<RelayHostedService>();
     builder.Services.AddHostedService<InventoryScanWorker>();
 
-    var host = builder.Build();
-    await host.RunAsync().ConfigureAwait(false);
+    // ---------------------------------------------------------------------------
+    // Build + run.
+    // ---------------------------------------------------------------------------
+    var app = builder.Build();
+
+    app.MapControllers();
+
+    await app.RunAsync().ConfigureAwait(false);
 }
 catch (Exception ex)
 {
@@ -145,16 +174,3 @@ finally
 {
     Log.CloseAndFlush();
 }
-
-// ---------------------------------------------------------------------------
-// TODO: Add Agent enrollment HTTP listener on port RELAY_LISTEN_PORT — AB#1666-followup.
-//
-// The Relay must accept inbound mTLS connections from local-LAN Agents on
-// the configured ListenPort, validate their one-time enrollment tokens,
-// issue per-Agent certificates, and persist Agent records via IAgentRegistry.
-// That listener will likely run as a Kestrel-hosted ASP.NET Core endpoint
-// alongside the BackgroundServices above (WebApplication can co-exist with
-// the Worker SDK via shared IHostBuilder configuration).
-//
-// Out of scope for tonight — tracked as AB#1666-followup.
-// ---------------------------------------------------------------------------
