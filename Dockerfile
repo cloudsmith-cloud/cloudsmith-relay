@@ -11,42 +11,42 @@ RUN --mount=type=secret,id=nuget_token \
 COPY . .
 RUN dotnet publish src/CloudSmith.Relay/CloudSmith.Relay.csproj -c Release -o /app/publish --no-restore
 
-# Runtime stage — glibc (bookworm-slim) is required because Microsoft's omi /
-# libpsrpclient.so (WSMan PowerShell Remoting native client) ships only for
-# glibc. Alpine (musl) has no PSRP/WSMan native build, which made the Relay
-# unable to open a runspace against Windows hosts (AB#1685).
+# --- WSMan native libs stage (AB#1685) ------------------------------------
+# Microsoft.PowerShell.SDK opens WSMan runspaces via libpsrpclient.so + libmi.so.
+# Neither the SDK nupkg nor the PowerShell 7.x distribution still ships these
+# on Linux — they were forked into the community-maintained PSWSMan module.
+# We extract the glibc-3 variant from the PSWSMan nupkg and stage them so the
+# runtime image can place them on the loader path.
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS wsmanlibs
+WORKDIR /wsman
+ARG PSWSMAN_VERSION=2.3.1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+ && curl -fsSL "https://www.powershellgallery.com/api/v2/package/PSWSMan/${PSWSMAN_VERSION}" -o pswsman.nupkg \
+ && unzip -q pswsman.nupkg -d pswsman \
+ && cp pswsman/bin/glibc-3/libpsrpclient.so /wsman/libpsrpclient.so \
+ && cp pswsman/bin/glibc-3/libmi.so         /wsman/libmi.so \
+ && test -f /wsman/libpsrpclient.so \
+ && test -f /wsman/libmi.so
+
+# --- Runtime stage --------------------------------------------------------
+# glibc base (bookworm-slim) is required because Microsoft's PSWSMan natives
+# are built for glibc only; the linux-musl-x64 variant of libpsrpclient does
+# not exist in any official source (root cause of AB#1685).
 FROM mcr.microsoft.com/dotnet/aspnet:9.0-bookworm-slim AS runtime
 WORKDIR /app
 
-# Install PowerShell remoting (WSMan) native client libs via the Microsoft
-# debian/12 prod repo. The `omi` package provides /opt/omi/lib/libpsrpclient.so
-# (and libmi.so), which Microsoft.PowerShell.SDK's RunspaceFactory probes when
-# opening a WSMan session. We symlink the libs into /usr/lib so the loader
-# resolves them without OMI_HOME wiring.
+# Runtime deps for the PSWSMan natives:
+#   * libssl3   — TLS for the WSMan client
+#   * libkrb5-3 — Kerberos auth path (domain-joined hosts; ADR-007 amendment)
+#   * libpam0g  — required by libmi.so's authentication shim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
-      curl \
-      gnupg \
       libssl3 \
       libkrb5-3 \
- && install -d -m 0755 /usr/share/keyrings \
- && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-      | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
- && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
-      > /etc/apt/sources.list.d/microsoft.list \
- && apt-get update \
- && apt-get install -y --no-install-recommends omi \
- && ln -sf /opt/omi/lib/libpsrpclient.so /usr/lib/libpsrpclient.so \
- && ln -sf /opt/omi/lib/libmi.so /usr/lib/libmi.so \
- && ldconfig \
- && apt-get purge -y curl gnupg \
- && apt-get autoremove -y \
+      libpam0g \
  && rm -rf /var/lib/apt/lists/*
-
-# Smoke test: fail the build if libpsrpclient.so isn't on the loader path.
-RUN ldconfig -p | grep -q libpsrpclient.so \
- || (echo "FATAL: libpsrpclient.so not found in ldconfig cache" && exit 1)
 
 # Relay's local LAN listen port for Agents (mTLS terminating)
 EXPOSE 8443
@@ -62,9 +62,30 @@ RUN groupadd --system relay \
  && mkdir -p /var/lib/cloudsmith-relay/identity \
  && chown -R relay:relay /var/lib/cloudsmith-relay \
  && chmod 700 /var/lib/cloudsmith-relay/identity
-USER relay
 
+# Publish output goes first so that we can drop the WSMan natives into
+# /app/runtimes/linux-x64/native/ after (the SDK's NativeLibrary loader probes
+# that path — same one the iter 1 stack trace showed).
 COPY --from=build --chown=relay:relay /app/publish .
+
+# Drop the WSMan native libs into the dotnet NativeLibrary probe path, and
+# symlink them into /usr/lib so anything that bypasses the runtimes/ probe
+# (direct dlopen by base name) can also resolve them.
+COPY --from=wsmanlibs --chown=relay:relay /wsman/libpsrpclient.so /app/runtimes/linux-x64/native/libpsrpclient.so
+COPY --from=wsmanlibs --chown=relay:relay /wsman/libmi.so         /app/runtimes/linux-x64/native/libmi.so
+RUN ln -sf /app/runtimes/linux-x64/native/libpsrpclient.so /usr/lib/libpsrpclient.so \
+ && ln -sf /app/runtimes/linux-x64/native/libmi.so         /usr/lib/libmi.so \
+ && ldconfig
+
+# Smoke test: ldconfig must report libpsrpclient.so and libmi.so. If not the
+# build is broken and we want it to fail here, not at runtime.
+RUN (ldconfig -p | grep -q libpsrpclient.so) \
+ && (ldconfig -p | grep -q libmi.so) \
+ || (echo "FATAL: WSMan native libs missing from ldconfig cache" \
+     && (ldconfig -p | grep -E 'libpsrp|libmi' || true) \
+     && exit 1)
+
+USER relay
 
 VOLUME ["/var/lib/cloudsmith-relay/identity"]
 
