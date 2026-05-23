@@ -1,0 +1,62 @@
+# Build output
+bin/
+obj/
+out/
+publish/
+*.dll
+*.pdb
+*.exe
+
+# .NET
+project.lock.json
+project.fragment.lock.json
+artifacts/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.coverage
+*.coveragexml
+coverage.opencover.xml
+.vs/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+*.received.*
+
+# Docker
+.dockerignore.local
+docker-compose.override.yml
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+appsettings.Development.json
+appsettings.Local.json
+*.pfx
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/

@@ -1,0 +1,42 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Authenticate to GitHub Packages (NuGet)
+        env:
+          NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dotnet nuget update source cloudsmith-github \
+            --username x-access-token \
+            --password "$NUGET_TOKEN" \
+            --store-password-in-clear-text \
+            --configfile nuget.config
+
+      - name: Restore
+        run: dotnet restore CloudSmith.Relay.sln
+
+      - name: Build
+        run: dotnet build CloudSmith.Relay.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test CloudSmith.Relay.sln --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
