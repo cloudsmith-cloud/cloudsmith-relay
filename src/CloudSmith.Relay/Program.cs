@@ -3,6 +3,7 @@
 
 using CloudSmith.Relay.Connection;
 using CloudSmith.Relay.Enrollment;
+using CloudSmith.Relay.Execution;
 using CloudSmith.Relay.Interfaces;
 using CloudSmith.Relay.State;
 using CloudSmith.Relay.Stubs;
@@ -28,14 +29,27 @@ var identityDir = Environment.GetEnvironmentVariable("RELAY_IDENTITY_DIR")
     ?? RelayEnrollmentClient.DefaultIdentityDirectory;
 var clusterId = Environment.GetEnvironmentVariable("RELAY_CLUSTER_ID") ?? "demo";
 
+// RELAY_HYPER_V_HOSTS — comma-separated Hyper-V hostnames/IPs to scan directly
+// via WinRM when no Agent is enrolled. Empty = liveness-only mode.
+var hyperVHostsRaw = Environment.GetEnvironmentVariable("RELAY_HYPER_V_HOSTS") ?? string.Empty;
+var hyperVHosts = hyperVHostsRaw
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .ToArray();
+
+// RELAY_PSREMOTE_USERNAME / RELAY_PSREMOTE_PASSWORD — local admin WinRM credential
+// for workgroup / not-yet-joined hosts. Not required for domain-joined (Kerberos).
+var psRemoteUsername = Environment.GetEnvironmentVariable("RELAY_PSREMOTE_USERNAME") ?? string.Empty;
+var psRemotePassword = Environment.GetEnvironmentVariable("RELAY_PSREMOTE_PASSWORD") ?? string.Empty;
+
 var relayOptions = new RelayOptions
 {
-    PaasUrl = paasUrl,
+    PaasUrl         = paasUrl,
     EnrollmentToken = enrollmentToken,
-    DisplayName = displayName,
-    ListenPort = listenPort,
+    DisplayName     = displayName,
+    ListenPort      = listenPort,
     IdentityDirectory = identityDir,
-    ClusterId = clusterId,
+    ClusterId       = clusterId,
+    HyperVHosts     = hyperVHosts,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,9 +108,26 @@ try
     // Host state tracking.
     builder.Services.AddSingleton<IHostStateTracker, HostStateTracker>();
 
-    // Agent registry + PSRemote executor still stubbed — AB#1666-followup.
+    // Agent registry — in-memory stub until Agent enrollment sprint lands.
     builder.Services.AddSingleton<IAgentRegistry, StubAgentRegistry>();
-    builder.Services.AddSingleton<IPSRemoteExecutor, StubPSRemoteExecutor>();
+
+    // PSRemote executor (AB#1680): use the real WSMan implementation when
+    // RELAY_PSREMOTE_USERNAME is set or when RELAY_HYPER_V_HOSTS lists hosts
+    // that are expected to be domain-joined (Kerberos, no creds needed).
+    // Fall back to no-op stub when neither is configured.
+    if (hyperVHosts.Length > 0)
+    {
+        builder.Services.AddSingleton(new PSRemoteCredential
+        {
+            Username = psRemoteUsername,
+            Password = psRemotePassword,
+        });
+        builder.Services.AddSingleton<IPSRemoteExecutor, PSRemoteExecutor>();
+    }
+    else
+    {
+        builder.Services.AddSingleton<IPSRemoteExecutor, StubPSRemoteExecutor>();
+    }
 
     // Background services.
     builder.Services.AddHostedService<RelayHostedService>();

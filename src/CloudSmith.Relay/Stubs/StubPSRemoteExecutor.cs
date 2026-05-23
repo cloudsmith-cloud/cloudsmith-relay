@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using CloudSmith.Relay.Interfaces;
+using CloudSmith.Relay.Messages;
 using CloudSmith.Relay.Models;
 
 namespace CloudSmith.Relay.Stubs;
 
 /// <summary>
-/// Placeholder <see cref="IPSRemoteExecutor"/>. Throws on every call; replaced by the
-/// real dual-credential WSMan implementation in the PSRemote sprint.
+/// Placeholder <see cref="IPSRemoteExecutor"/> used when no PSRemote credential is
+/// configured. Returns empty results rather than throwing, so the scan worker
+/// degrades gracefully instead of crashing.
 /// </summary>
 public sealed class StubPSRemoteExecutor : IPSRemoteExecutor
 {
@@ -17,6 +19,10 @@ public sealed class StubPSRemoteExecutor : IPSRemoteExecutor
         string script,
         IDictionary<string, object>? args,
         CancellationToken ct) =>
-        throw new NotImplementedException(
-            "AB#XXXX not yet implemented — PSRemote dual-credential executor (Roadmap phase 5).");
+        Task.FromResult(new PSResult([], [], Success: false));
+
+    public Task<IReadOnlyList<VmSnapshot>> GetInventoryAsync(
+        string hostId,
+        CancellationToken ct) =>
+        Task.FromResult<IReadOnlyList<VmSnapshot>>(Array.Empty<VmSnapshot>());
 }
