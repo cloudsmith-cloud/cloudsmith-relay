@@ -13,19 +13,29 @@ using Xunit;
 namespace CloudSmith.Relay.Tests.PSRemote;
 
 /// <summary>
-/// Smoke tests for <see cref="InventoryScanWorker"/> PSRemote path (AB#1680).
-/// Verifies that when RELAY_HYPER_V_HOSTS is configured, the worker calls
-/// IPSRemoteExecutor.GetInventoryAsync and sends the resulting VMs over the
-/// relay connection.
+/// Smoke tests for <see cref="InventoryScanWorker"/> PSRemote path (AB#1680 / AB#1665).
+/// Verifies that when RELAY_HYPER_V_HOSTS is configured and no Agent is enrolled,
+/// the worker calls IPSRemoteExecutor.GetInventoryAsync and sends the resulting VMs
+/// over the relay connection. Also verifies that when an Agent IS enrolled for a host,
+/// PSRemote is skipped (the Agent pushes inventory directly to the LAN listener).
 /// </summary>
 public sealed class InventoryScanWorkerTests
 {
+    // Helper: mock IAgentRegistry that returns null for all hosts (no enrolled agents).
+    private static Mock<IAgentRegistry> NoAgentsRegistry()
+    {
+        var mock = new Mock<IAgentRegistry>();
+        mock.Setup(r => r.GetAgentForHostAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Models.Agent?)null);
+        return mock;
+    }
+
     /// <summary>
-    /// When two dummy VMs are returned by the mock PSRemote executor, the
-    /// InventoryScanWorker sends a single InventoryPush with both VMs.
+    /// When two dummy VMs are returned by the mock PSRemote executor and no Agent is
+    /// enrolled for the host, the InventoryScanWorker sends a single InventoryPush with both VMs.
     /// </summary>
     [Fact]
-    public async Task ScanOnce_WithTwoVms_SendsInventoryPushWithBothVms()
+    public async Task ScanOnce_WithTwoVms_NoAgent_SendsInventoryPushWithBothVms()
     {
         // Arrange
         var now = DateTimeOffset.UtcNow;
@@ -59,6 +69,7 @@ public sealed class InventoryScanWorkerTests
             opts,
             mockConnection.Object,
             mockPsRemote.Object,
+            NoAgentsRegistry().Object,
             NullLogger<InventoryScanWorker>.Instance);
 
         // Act
@@ -105,6 +116,7 @@ public sealed class InventoryScanWorkerTests
             opts,
             mockConnection.Object,
             mockPsRemote.Object,
+            NoAgentsRegistry().Object,
             NullLogger<InventoryScanWorker>.Instance);
 
         // Act
@@ -114,5 +126,57 @@ public sealed class InventoryScanWorkerTests
         mockPsRemote.Verify(e => e.GetInventoryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         Assert.NotNull(capturedPush);
         Assert.Empty(capturedPush!.Vms);
+    }
+
+    /// <summary>
+    /// When an Agent is enrolled for a host, the PSRemote scan is skipped — the Agent
+    /// pushes inventory directly to the LAN listener.
+    /// </summary>
+    [Fact]
+    public async Task ScanOnce_AgentEnrolledForHost_SkipsPsRemoteScan()
+    {
+        // Arrange
+        var mockPsRemote   = new Mock<IPSRemoteExecutor>();
+        var mockConnection = new Mock<IRelayConnection>();
+        mockConnection.SetupGet(c => c.IsConnected).Returns(true);
+        mockConnection
+            .Setup(c => c.SendAsync(It.IsAny<RelayMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        // An agent IS enrolled for hv-host-01 — PSRemote should be skipped.
+        var enrolledAgent = new Models.Agent(
+            AgentId:       "agent-123",
+            HostId:        "hv-host-01",
+            Hostname:      "hv-host-01",
+            EnrolledAtUtc: DateTimeOffset.UtcNow,
+            LastSeenUtc:   DateTimeOffset.UtcNow);
+
+        var mockAgentRegistry = new Mock<IAgentRegistry>();
+        mockAgentRegistry
+            .Setup(r => r.GetAgentForHostAsync("hv-host-01", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(enrolledAgent);
+
+        var opts = Options.Create(new RelayOptions
+        {
+            PaasUrl     = "https://api.test.local",
+            DisplayName = "test-relay",
+            ClusterId   = "cluster-99",
+            HyperVHosts = new[] { "hv-host-01" },
+        });
+
+        var worker = new InventoryScanWorker(
+            opts,
+            mockConnection.Object,
+            mockPsRemote.Object,
+            mockAgentRegistry.Object,
+            NullLogger<InventoryScanWorker>.Instance);
+
+        // Act
+        await worker.ScanOnceAsync(CancellationToken.None);
+
+        // Assert — PSRemote never called; Agent handles its own push via LAN listener.
+        mockPsRemote.Verify(
+            e => e.GetInventoryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 }
