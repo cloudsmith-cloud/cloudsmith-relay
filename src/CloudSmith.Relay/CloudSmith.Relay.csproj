@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Worker">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
@@ -10,7 +10,7 @@
     <Version>0.0.1</Version>
     <Authors>CloudSmith Contributors</Authors>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-    <Description>Per-site Linux bridge between CloudSmith PaaS and on-prem Agents / PSRemote hosts (scaffold).</Description>
+    <Description>Per-site Linux bridge between CloudSmith PaaS and on-prem Agents / PSRemote hosts.</Description>
     <UserSecretsId>cloudsmith-relay-dev</UserSecretsId>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <LangVersion>latest</LangVersion>
