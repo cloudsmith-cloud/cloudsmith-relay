@@ -20,21 +20,50 @@ namespace CloudSmith.Relay.Execution;
 ///   All other states → use the configured local admin credential stored in
 ///     <see cref="PSRemoteCredential"/> supplied at construction time.
 ///
+/// Transport selection for non-domain-joined hosts (AB#1686 amendment):
+///   <c>RELAY_PSREMOTE_TRANSPORT=https-basic</c> (default) → HTTPS:5986 + Basic +
+///     SkipCACheck + SkipCNCheck. This is the Ansible-on-Windows MVP pattern and
+///     the only transport that works from a Linux container against Server 2025
+///     after Microsoft's NTLM-over-HTTP hardening — PSWSMan 2.3.1's forked WSMan
+///     natives return MI_RESULT_ACCESS_DENIED for Negotiate-over-HTTP against
+///     Server 2025 even with valid local admin credentials.
+///   <c>RELAY_PSREMOTE_TRANSPORT=http-negotiate</c> → legacy HTTP:5985 + Negotiate
+///     (NTLM). Kept for older targets / debugging.
+///
 /// AB#1680 — replaces <see cref="CloudSmith.Relay.Stubs.StubPSRemoteExecutor"/>.
 /// </summary>
 public sealed class PSRemoteExecutor : IPSRemoteExecutor
 {
+    /// <summary>HTTPS:5986 + Basic + skip-cert (Server 2025 MVP default).</summary>
+    public const string TransportHttpsBasic   = "https-basic";
+
+    /// <summary>HTTP:5985 + Negotiate (legacy, broken on Server 2025).</summary>
+    public const string TransportHttpNegotiate = "http-negotiate";
+
     private readonly IHostStateTracker _stateTracker;
     private readonly PSRemoteCredential _credential;
+    private readonly string _transport;
     private readonly ILogger<PSRemoteExecutor> _logger;
 
     public PSRemoteExecutor(
         IHostStateTracker stateTracker,
         PSRemoteCredential credential,
         ILogger<PSRemoteExecutor> logger)
+        : this(stateTracker, credential, ResolveTransportFromEnv(), logger)
+    {
+    }
+
+    // Internal constructor for unit tests — bypasses env-var lookup so tests
+    // can assert behaviour for both transports deterministically.
+    internal PSRemoteExecutor(
+        IHostStateTracker stateTracker,
+        PSRemoteCredential credential,
+        string transport,
+        ILogger<PSRemoteExecutor> logger)
     {
         _stateTracker = stateTracker;
         _credential   = credential;
+        _transport    = NormalizeTransport(transport);
         _logger       = logger;
     }
 
@@ -144,13 +173,31 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
 
     private Runspace OpenRunspace(string hostId)
     {
-        var state = _stateTracker.GetState(hostId);
+        var connInfo = BuildConnectionInfo(hostId, _stateTracker.GetState(hostId), _credential, _transport);
+        var runspace = RunspaceFactory.CreateRunspace(connInfo);
+        runspace.Open();
+        return runspace;
+    }
+
+    /// <summary>
+    /// Build a <see cref="WSManConnectionInfo"/> for the given host. Exposed as
+    /// <c>internal</c> so unit tests can assert the resulting scheme/port/auth/skip
+    /// flags without standing up a runspace.
+    /// </summary>
+    internal static WSManConnectionInfo BuildConnectionInfo(
+        string hostId,
+        HostState state,
+        PSRemoteCredential credential,
+        string transport)
+    {
         WSManConnectionInfo connInfo;
 
         if (state == HostState.DomainJoined)
         {
             // Kerberos — no credential object; rely on the process's ambient identity
             // or a Kerberos credential cache injected at container startup.
+            // Domain-joined uses HTTP:5985 + Kerberos (Phase V will revisit with
+            // proper PKI). Server 2025 NTLM hardening does NOT affect Kerberos.
             connInfo = new WSManConnectionInfo(
                 useSsl:       false,
                 computerName: hostId,
@@ -160,16 +207,29 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
                 credential:   null);
             connInfo.AuthenticationMechanism = AuthenticationMechanism.Kerberos;
         }
+        else if (string.Equals(transport, TransportHttpsBasic, StringComparison.OrdinalIgnoreCase))
+        {
+            // AB#1686 — Server 2025 NTLM hardening + PSWSMan's forked WSMan natives
+            // make Negotiate-over-HTTP infeasible. Switch to HTTPS:5986 + Basic +
+            // skip-cert-validation (Ansible-on-Windows MVP pattern). Operator is
+            // responsible for provisioning the WinRM HTTPS listener (the iter
+            // playbook does this for the cluster-sim VM). Phase V will tighten
+            // with proper PKI + cert validation.
+            var psCredential = BuildPSCredential(credential);
+
+            connInfo = new WSManConnectionInfo(
+                new Uri($"https://{hostId}:5986/wsman"),
+                "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
+                psCredential);
+            connInfo.AuthenticationMechanism = AuthenticationMechanism.Basic;
+            connInfo.SkipCACheck = true;
+            connInfo.SkipCNCheck = true;
+        }
         else
         {
-            // Workgroup / Joining / Unknown — use the local admin credential.
-            var psCredential = string.IsNullOrWhiteSpace(_credential.Username)
-                ? null
-                : new PSCredential(
-                    _credential.Username,
-                    _credential.Password.Length > 0
-                        ? CreateSecureString(_credential.Password)
-                        : new System.Security.SecureString());
+            // Legacy HTTP:5985 + Negotiate (NTLM) — kept for older targets and
+            // for debugging. Broken on Server 2025 (returns MI_RESULT_ACCESS_DENIED).
+            var psCredential = BuildPSCredential(credential);
 
             connInfo = new WSManConnectionInfo(
                 useSsl:       false,
@@ -178,22 +238,45 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
                 appName:      "/wsman",
                 shellUri:     "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
                 credential:   psCredential);
-            // Negotiate (NTLM over HTTP) is the right choice for workgroup /
-            // non-domain hosts when the Relay runs on Linux: PSWSMan refuses
-            // Basic over HTTP ("Basic authentication is not supported over HTTP
-            // on Unix") and we don't want to require certs in the LAN MVP
-            // (ADR-007 amendment 2026-05-23). Negotiate uses NTLM here because
-            // there is no Kerberos KDC reachable from a workgroup host.
             connInfo.AuthenticationMechanism = AuthenticationMechanism.Negotiate;
         }
 
-        connInfo.OperationTimeout    = 30_000; // 30 s
-        connInfo.OpenTimeout         = 20_000; // 20 s
+        connInfo.OperationTimeout    = 60_000; // 60 s
+        connInfo.OpenTimeout         = 30_000; // 30 s
         connInfo.MaximumReceivedDataSizePerCommand = 50 * 1024 * 1024; // 50 MB
 
-        var runspace = RunspaceFactory.CreateRunspace(connInfo);
-        runspace.Open();
-        return runspace;
+        return connInfo;
+    }
+
+    private static PSCredential? BuildPSCredential(PSRemoteCredential credential)
+    {
+        if (string.IsNullOrWhiteSpace(credential.Username))
+            return null;
+
+        var secure = credential.Password.Length > 0
+            ? CreateSecureString(credential.Password)
+            : new System.Security.SecureString();
+        return new PSCredential(credential.Username, secure);
+    }
+
+    private static string ResolveTransportFromEnv()
+    {
+        var raw = Environment.GetEnvironmentVariable("RELAY_PSREMOTE_TRANSPORT");
+        return NormalizeTransport(raw);
+    }
+
+    private static string NormalizeTransport(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return TransportHttpsBasic; // MVP default (AB#1686)
+
+        var v = raw.Trim().ToLowerInvariant();
+        return v switch
+        {
+            TransportHttpsBasic   => TransportHttpsBasic,
+            TransportHttpNegotiate => TransportHttpNegotiate,
+            _ => TransportHttpsBasic, // unknown → safe default
+        };
     }
 
     // -------------------------------------------------------------------------
