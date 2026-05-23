@@ -33,4 +33,11 @@ public sealed class RelayOptions
 
     /// <summary>Inventory scan cadence.</summary>
     public TimeSpan InventoryScanInterval { get; init; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Hyper-V hosts to scan directly via PSRemote when no Agent is enrolled.
+    /// Populated from <c>RELAY_HYPER_V_HOSTS</c> (comma-separated hostnames/IPs).
+    /// Empty list = liveness-only mode (pushes empty inventory).
+    /// </summary>
+    public IReadOnlyList<string> HyperVHosts { get; init; } = Array.Empty<string>();
 }

@@ -1,6 +1,7 @@
 // Copyright 2026 CloudSmith Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+using CloudSmith.Relay.Messages;
 using CloudSmith.Relay.Models;
 
 namespace CloudSmith.Relay.Interfaces;
@@ -26,4 +27,12 @@ public interface IPSRemoteExecutor
         string script,
         IDictionary<string, object>? args,
         CancellationToken ct);
+
+    /// <summary>
+    /// Run <c>Get-VM</c> against <paramref name="hostId"/> via WinRM and return
+    /// a <see cref="VmSnapshot"/> per discovered virtual machine. (AB#1680)
+    /// </summary>
+    /// <param name="hostId">Hostname or IP of the Hyper-V host to scan.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<IReadOnlyList<VmSnapshot>> GetInventoryAsync(string hostId, CancellationToken ct);
 }
