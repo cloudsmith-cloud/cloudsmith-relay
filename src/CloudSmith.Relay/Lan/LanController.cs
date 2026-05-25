@@ -3,6 +3,7 @@
 
 using CloudSmith.Relay.Connection;
 using CloudSmith.Relay.Messages;
+using CloudSmith.Relay.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 
@@ -27,15 +28,18 @@ namespace CloudSmith.Relay.Lan;
 public sealed class LanController : ControllerBase
 {
     private readonly InMemoryAgentRegistry _registry;
+    private readonly AgentJobQueue _jobQueue;
     private readonly IRelayConnection _connection;
     private readonly ILogger<LanController> _logger;
 
     public LanController(
         InMemoryAgentRegistry registry,
+        AgentJobQueue jobQueue,
         IRelayConnection connection,
         ILogger<LanController> logger)
     {
         _registry = registry;
+        _jobQueue = jobQueue;
         _connection = connection;
         _logger = logger;
     }
@@ -138,6 +142,88 @@ public sealed class LanController : ControllerBase
             req.Checks ?? new List<Messages.HealthCheck>());
 
         await ForwardAsync(push, ct);
+        return Ok(new { ack = true });
+    }
+
+    // -------------------------------------------------------------------------
+    // GET /lan/v1/agents/{agentId}/jobs
+    // -------------------------------------------------------------------------
+
+    [HttpGet("{agentId}/jobs")]
+    public IActionResult GetJobs(string agentId)
+    {
+        if (!AuthenticateAgent(agentId, out var problem))
+            return problem!;
+
+        var jobs = _jobQueue.Dequeue(agentId);
+        _logger.LogDebug("Job poll: agentId={AgentId} count={Count}", agentId, jobs.Count);
+        return Ok(jobs.Select(j => new
+        {
+            jobId   = j.JobId,
+            jobType = j.Kind,
+            payload = new { scriptName = j.Kind, arguments = (Dictionary<string, string>?)null },
+            traceparent = (string?)null,
+        }));
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /lan/v1/agents/{agentId}/jobs/{jobId}/result
+    // -------------------------------------------------------------------------
+
+    [HttpPost("{agentId}/jobs/{jobId}/result")]
+    public async Task<IActionResult> JobResultAsync(
+        string agentId,
+        string jobId,
+        [FromBody] AgentJobResultRequest req,
+        CancellationToken ct)
+    {
+        if (!AuthenticateAgent(agentId, out var problem))
+            return problem!;
+
+        if (req is null) return BadRequest(new { error = "Request body is required." });
+
+        var result = new JobResult(
+            jobId,
+            req.Succeeded,
+            req.Output,
+            req.Error,
+            DateTimeOffset.UtcNow);
+
+        _jobQueue.CompleteJob(result);
+
+        // Forward result to PaaS over WebSocket.
+        var ack = new JobAck(jobId, req.Succeeded ? "succeeded" : "failed", req.Error);
+        await ForwardAsync(ack, ct);
+
+        _logger.LogInformation("Job result: agentId={AgentId} jobId={JobId} succeeded={Ok}",
+            agentId, jobId, req.Succeeded);
+
+        return Ok(new { ack = true });
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /lan/v1/agents/{agentId}/hardware
+    // -------------------------------------------------------------------------
+
+    [HttpPost("{agentId}/hardware")]
+    public async Task<IActionResult> HardwareAsync(
+        string agentId,
+        [FromBody] AgentHardwareRequest req,
+        CancellationToken ct)
+    {
+        if (!AuthenticateAgent(agentId, out var problem))
+            return problem!;
+
+        if (req is null) return BadRequest(new { error = "Request body is required." });
+
+        _logger.LogInformation("Hardware from agentId={AgentId}: host={Host} cpu={Cpu} mem={Mem}GB",
+            agentId, req.HostId, req.ProcessorCount, req.TotalMemoryBytes / (1024L * 1024 * 1024));
+
+        // Forward hardware snapshot to PaaS over WebSocket.
+        var push = new HardwarePush(req.HostId, req.ProcessorCount, req.LogicalCoreCount,
+            req.ProcessorName, req.TotalMemoryBytes, DateTimeOffset.UtcNow);
+        await ForwardAsync(push, ct);
+
         return Ok(new { ack = true });
     }
 
