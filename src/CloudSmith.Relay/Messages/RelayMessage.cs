@@ -14,6 +14,7 @@ namespace CloudSmith.Relay.Messages;
 [JsonDerivedType(typeof(JobAck), typeDiscriminator: "job.ack")]
 [JsonDerivedType(typeof(InventoryPush), typeDiscriminator: "inventory.push")]
 [JsonDerivedType(typeof(HealthProbePush), typeDiscriminator: "health.push")]
+[JsonDerivedType(typeof(HardwarePush), typeDiscriminator: "hardware.push")]
 [JsonDerivedType(typeof(Heartbeat), typeDiscriminator: "heartbeat")]
 public abstract record RelayMessage;
 
@@ -39,6 +40,15 @@ public sealed record HealthProbePush(
     string ClusterId,
     string Status,
     IReadOnlyList<HealthCheck> Checks) : RelayMessage;
+
+/// <summary>Relay -> PaaS: host hardware snapshot.</summary>
+public sealed record HardwarePush(
+    string HostId,
+    int ProcessorCount,
+    int LogicalCoreCount,
+    string? ProcessorName,
+    long TotalMemoryBytes,
+    DateTimeOffset ObservedAtUtc) : RelayMessage;
 
 /// <summary>Relay -> PaaS: liveness heartbeat.</summary>
 public sealed record Heartbeat(DateTimeOffset At) : RelayMessage;

@@ -133,6 +133,9 @@ try
     builder.Services.AddSingleton<IAgentRegistry>(sp =>
         sp.GetRequiredService<InMemoryAgentRegistry>());
 
+    // Job queue — routes jobs from PaaS (WebSocket) to Agents (LAN poll).
+    builder.Services.AddSingleton<AgentJobQueue>();
+
     // ---------------------------------------------------------------------------
     // PSRemote executor — real when RELAY_HYPER_V_HOSTS is set, stub otherwise.
     // ---------------------------------------------------------------------------
