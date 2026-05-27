@@ -282,7 +282,20 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
 
     private Runspace OpenLegacyRunspace(string hostId)
     {
-        var connInfo = BuildConnectionInfo(hostId, _stateTracker.GetState(hostId), _credential, _transport);
+        var state    = _stateTracker.GetState(hostId);
+        var connInfo = BuildConnectionInfo(hostId, state, _credential, _transport);
+
+        // Emit a warning when the legacy HTTPS+Basic path is used: TLS validation is
+        // unconditionally skipped there (see SECURITY NOTE in BuildConnectionInfo).
+        if (state != HostState.DomainJoined &&
+            string.Equals(_transport, TransportHttpsBasic, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "PSRemote TLS certificate validation is disabled for host {Host} (legacy https-basic path). " +
+                "Set CaThumbprint in connection options for production use.",
+                hostId);
+        }
+
         var runspace = RunspaceFactory.CreateRunspace(connInfo);
         runspace.Open();
         return runspace;
@@ -359,6 +372,13 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
             // AB#1686 — Server 2025 NTLM hardening + PSWSMan's forked WSMan natives
             // make Negotiate-over-HTTP infeasible. Switch to HTTPS:5986 + Basic +
             // skip-cert-validation (Ansible-on-Windows MVP pattern).
+            //
+            // SECURITY NOTE (H1 / ADR-057): TLS validation is unconditionally skipped
+            // in this legacy path because PSRemoteCredential carries no CaThumbprint.
+            // This path is only reached for Workgroup hosts without a client certificate;
+            // it should be eliminated in Phase V when operator-provisioned PKI is in
+            // place.  The warning below makes the insecure configuration visible in
+            // operator logs until then.
             var psCredential = BuildPSCredential(credential);
 
             connInfo = new WSManConnectionInfo(

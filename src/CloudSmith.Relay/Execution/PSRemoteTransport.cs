@@ -172,7 +172,7 @@ public sealed class PSRemoteTransport
     // WSManConnectionInfo builders (HTTPS:5986 only)
     // -------------------------------------------------------------------------
 
-    private static WSManConnectionInfo BuildKerberosInfo(PSRemoteConnectionOptions options)
+    private WSManConnectionInfo BuildKerberosInfo(PSRemoteConnectionOptions options)
     {
         // Kerberos over HTTPS:5986.
         // No explicit PSCredential — the relay's ambient Kerberos identity (machine
@@ -185,14 +185,12 @@ public sealed class PSRemoteTransport
 
         connInfo.AuthenticationMechanism = AuthenticationMechanism.Kerberos;
 
-        // Skip cert validation — Phase V will introduce proper PKI.
-        connInfo.SkipCACheck = true;
-        connInfo.SkipCNCheck = true;
+        ApplyTlsValidation(connInfo, options);
 
         return connInfo;
     }
 
-    private static WSManConnectionInfo BuildCertificateInfo(PSRemoteConnectionOptions options)
+    private WSManConnectionInfo BuildCertificateInfo(PSRemoteConnectionOptions options)
     {
         // Certificate auth over HTTPS:5986.
         // WSManConnectionInfo.CertificateThumbprint is the standard way to specify
@@ -205,10 +203,39 @@ public sealed class PSRemoteTransport
         connInfo.AuthenticationMechanism = AuthenticationMechanism.Certificate;
         connInfo.CertificateThumbprint   = options.ClientCertificate!.Thumbprint;
 
-        // Skip CA/CN check — caller is responsible for cert trust in Phase V.
-        connInfo.SkipCACheck = true;
-        connInfo.SkipCNCheck = true;
+        ApplyTlsValidation(connInfo, options);
 
         return connInfo;
+    }
+
+    /// <summary>
+    /// Apply TLS server-certificate validation to <paramref name="connInfo"/> based on
+    /// whether <see cref="PSRemoteConnectionOptions.CaThumbprint"/> is configured.
+    ///
+    /// When a thumbprint is present, CA and CN checks are enabled and the thumbprint is
+    /// set on the connection so WSMan can validate the server certificate chain.
+    ///
+    /// When no thumbprint is configured, both checks are skipped and a warning is logged
+    /// so that the insecure configuration is visible in operator logs.  This mode is
+    /// acceptable only for development/test environments without PKI (see ADR-057).
+    /// </summary>
+    private void ApplyTlsValidation(WSManConnectionInfo connInfo, PSRemoteConnectionOptions options)
+    {
+        var hasCaThumbprint = !string.IsNullOrEmpty(options.CaThumbprint);
+
+        connInfo.SkipCACheck = !hasCaThumbprint;
+        connInfo.SkipCNCheck = !hasCaThumbprint;
+
+        if (hasCaThumbprint)
+        {
+            connInfo.CertificateThumbprint = options.CaThumbprint;
+        }
+        else
+        {
+            _logger.LogWarning(
+                "PSRemote TLS certificate validation is disabled for host {Host}. " +
+                "Set CaThumbprint in connection options for production use.",
+                options.Hostname);
+        }
     }
 }
