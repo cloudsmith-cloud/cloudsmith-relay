@@ -14,42 +14,41 @@ namespace CloudSmith.Relay.Execution;
 /// Real <see cref="IPSRemoteExecutor"/> implementation backed by
 /// <see cref="System.Management.Automation"/> WSMan remoting.
 ///
-/// Credential selection per ADR-007 (2026-05-23 amendment):
-///   <see cref="HostState.DomainJoined"/> → Kerberos (no credentials object — rely
-///     on the Relay container's machine account or the configured Kerberos context).
-///   All other states → use the configured local admin credential stored in
-///     <see cref="PSRemoteCredential"/> supplied at construction time.
+/// Auth / transport is fully delegated to <see cref="PSRemoteTransport"/> (AB#1666):
+///   • Domain context detected via <c>USERDNSDOMAIN</c> env var → Kerberos over HTTPS:5986.
+///   • No domain context + <see cref="PSRemoteCredential.ClientCertificate"/> set → cert auth over HTTPS:5986.
+///   • No domain context + no cert → falls back to Basic+skip-cert over HTTPS:5986
+///     (legacy <see cref="TransportHttpsBasic"/> path, kept for Workgroup hosts without a cert).
+///   • HTTP:5985 is never used by <see cref="PSRemoteTransport"/>; the legacy Negotiate path
+///     is kept only in <see cref="BuildConnectionInfo"/> for backwards compatibility with tests.
 ///
-/// Transport selection for non-domain-joined hosts (AB#1686 amendment):
-///   <c>RELAY_PSREMOTE_TRANSPORT=https-basic</c> (default) → HTTPS:5986 + Basic +
-///     SkipCACheck + SkipCNCheck. This is the Ansible-on-Windows MVP pattern and
-///     the only transport that works from a Linux container against Server 2025
-///     after Microsoft's NTLM-over-HTTP hardening — PSWSMan 2.3.1's forked WSMan
-///     natives return MI_RESULT_ACCESS_DENIED for Negotiate-over-HTTP against
-///     Server 2025 even with valid local admin credentials.
-///   <c>RELAY_PSREMOTE_TRANSPORT=http-negotiate</c> → legacy HTTP:5985 + Negotiate
-///     (NTLM). Kept for older targets / debugging.
+/// Credential selection (per ADR-007, 2026-05-23 amendment):
+///   <see cref="HostState.DomainJoined"/> → <see cref="PSRemoteTransport"/> Kerberos path.
+///   All other states → <see cref="PSRemoteTransport"/> Auto path (cert → Basic fallback).
 ///
 /// AB#1680 — replaces <see cref="CloudSmith.Relay.Stubs.StubPSRemoteExecutor"/>.
+/// AB#1666 — auth/transport logic extracted to <see cref="PSRemoteTransport"/>.
 /// </summary>
 public sealed class PSRemoteExecutor : IPSRemoteExecutor
 {
-    /// <summary>HTTPS:5986 + Basic + skip-cert (Server 2025 MVP default).</summary>
+    /// <summary>HTTPS:5986 + Basic + skip-cert (Server 2025 MVP default for non-cert Workgroup hosts).</summary>
     public const string TransportHttpsBasic   = "https-basic";
 
-    /// <summary>HTTP:5985 + Negotiate (legacy, broken on Server 2025).</summary>
+    /// <summary>HTTP:5985 + Negotiate (legacy, broken on Server 2025; retained for test compat only).</summary>
     public const string TransportHttpNegotiate = "http-negotiate";
 
     private readonly IHostStateTracker _stateTracker;
     private readonly PSRemoteCredential _credential;
     private readonly string _transport;
+    private readonly PSRemoteTransport _psRemoteTransport;
     private readonly ILogger<PSRemoteExecutor> _logger;
 
     public PSRemoteExecutor(
         IHostStateTracker stateTracker,
         PSRemoteCredential credential,
+        PSRemoteTransport psRemoteTransport,
         ILogger<PSRemoteExecutor> logger)
-        : this(stateTracker, credential, ResolveTransportFromEnv(), logger)
+        : this(stateTracker, credential, psRemoteTransport, ResolveTransportFromEnv(), logger)
     {
     }
 
@@ -58,13 +57,15 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
     internal PSRemoteExecutor(
         IHostStateTracker stateTracker,
         PSRemoteCredential credential,
+        PSRemoteTransport psRemoteTransport,
         string transport,
         ILogger<PSRemoteExecutor> logger)
     {
-        _stateTracker = stateTracker;
-        _credential   = credential;
-        _transport    = NormalizeTransport(transport);
-        _logger       = logger;
+        _stateTracker      = stateTracker;
+        _credential        = credential;
+        _psRemoteTransport = psRemoteTransport;
+        _transport         = NormalizeTransport(transport);
+        _logger            = logger;
     }
 
     /// <inheritdoc />
@@ -74,104 +75,212 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
         IDictionary<string, object>? args,
         CancellationToken ct)
     {
-        return Task.Run(() =>
+        return Task.Run(async () =>
         {
-            using var runspace = OpenRunspace(hostId);
-            using var ps       = System.Management.Automation.PowerShell.Create();
-            ps.Runspace = runspace;
+            var state = _stateTracker.GetState(hostId);
 
-            var cmd = ps.AddScript(script);
-            if (args is not null)
+            // Delegate to PSRemoteTransport (AB#1666) when the host is domain-joined
+            // or when a client certificate is available. Legacy Basic path for Workgroup
+            // hosts without a cert is handled below.
+            if (state == HostState.DomainJoined || _credential.ClientCertificate is not null)
             {
-                foreach (var kv in args)
-                    cmd.AddParameter(kv.Key, kv.Value);
+                return await InvokeViaTransportAsync(hostId, state, script, args, ct)
+                    .ConfigureAwait(false);
             }
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var results = ps.Invoke();
-            sw.Stop();
-
-            IReadOnlyList<object> output = results
-                .Select(o => o?.BaseObject ?? (object)string.Empty)
-                .ToList();
-            var firstError = ps.Streams.Error.FirstOrDefault()?.ToString();
-
-            if (ps.HadErrors)
-            {
-                _logger.LogWarning(
-                    "PSRemote {Host}: script produced error(s): {FirstError}",
-                    hostId, firstError);
-            }
-
-            return new PSResult(
-                Success:     !ps.HadErrors,
-                Output:      output,
-                ErrorRecord: firstError,
-                Elapsed:     sw.Elapsed);
+            // Legacy Basic/Negotiate path (Workgroup without cert).
+            return await Task.Run(() => InvokeLegacy(hostId, script, args), ct)
+                .ConfigureAwait(false);
         }, ct);
     }
 
-    /// <summary>
-    /// Run <c>Get-VM</c> / <c>Get-VMHost</c> on <paramref name="hostId"/> and
-    /// return a <see cref="VmSnapshot"/> for every VM found.
-    /// </summary>
+    /// <inheritdoc />
     public Task<IReadOnlyList<VmSnapshot>> GetInventoryAsync(string hostId, CancellationToken ct)
     {
-        return Task.Run<IReadOnlyList<VmSnapshot>>(() =>
+        return Task.Run(async () =>
         {
-            using var runspace = OpenRunspace(hostId);
-            using var ps       = System.Management.Automation.PowerShell.Create();
-            ps.Runspace = runspace;
+            var state = _stateTracker.GetState(hostId);
 
-            _logger.LogInformation("PSRemote {Host}: running Get-VM", hostId);
-
-            // Get-VM returns Microsoft.HyperV.PowerShell.VirtualMachine objects.
-            ps.AddCommand("Get-VM");
-            var vms = ps.Invoke();
-
-            if (ps.HadErrors)
+            if (state == HostState.DomainJoined || _credential.ClientCertificate is not null)
             {
-                foreach (var err in ps.Streams.Error)
-                    _logger.LogWarning("PSRemote {Host}: Get-VM error: {Err}", hostId, err?.ToString());
+                return await GetInventoryViaTransportAsync(hostId, state, ct)
+                    .ConfigureAwait(false);
             }
 
-            var snapshots = new List<VmSnapshot>(vms.Count);
-            var now = DateTimeOffset.UtcNow;
-            foreach (var vm in vms)
-            {
-                if (vm?.BaseObject is null) continue;
-
-                // Access via dynamic or PSMemberInfo to avoid hard reference to
-                // Microsoft.HyperV.PowerShell assembly (not available in the relay
-                // container — only the PowerShell remoting pipeline is used).
-                var name   = GetPropertyString(vm, "Name")   ?? GetPropertyString(vm, "VMName") ?? "unknown";
-                var vmGuid = GetPropertyString(vm, "VMId")   ?? GetPropertyString(vm, "Id")     ?? Guid.NewGuid().ToString();
-                var state  = GetPropertyString(vm, "State")  ?? "unknown";
-                var cpuCount = GetPropertyInt(vm, "ProcessorCount") ?? 0;
-
-                // MemoryAssigned is bytes; fall back to MemoryStartup.
-                var memBytes  = GetPropertyLong(vm, "MemoryAssigned") ?? GetPropertyLong(vm, "MemoryStartup") ?? 0L;
-
-                snapshots.Add(new VmSnapshot(
-                    VmId:          vmGuid,
-                    Name:          name,
-                    HostId:        hostId,
-                    State:         state,
-                    CpuCount:      cpuCount,
-                    MemoryBytes:   memBytes,
-                    ObservedAtUtc: now));
-            }
-
-            _logger.LogInformation("PSRemote {Host}: found {Count} VM(s)", hostId, snapshots.Count);
-            return snapshots;
+            return await Task.Run(() => GetInventoryLegacy(hostId), ct)
+                .ConfigureAwait(false);
         }, ct);
     }
 
     // -------------------------------------------------------------------------
-    // Runspace factory
+    // PSRemoteTransport-delegating paths (AB#1666)
     // -------------------------------------------------------------------------
 
-    private Runspace OpenRunspace(string hostId)
+    private async Task<PSResult> InvokeViaTransportAsync(
+        string hostId,
+        HostState state,
+        string script,
+        IDictionary<string, object>? args,
+        CancellationToken ct)
+    {
+        var opts = BuildTransportOptions(hostId, state);
+
+        using var session = await _psRemoteTransport.ConnectAsync(opts, ct).ConfigureAwait(false);
+        using var ps      = System.Management.Automation.PowerShell.Create();
+        ps.Runspace = session.Runspace;
+
+        var cmd = ps.AddScript(script);
+        if (args is not null)
+        {
+            foreach (var kv in args)
+                cmd.AddParameter(kv.Key, kv.Value);
+        }
+
+        var sw      = System.Diagnostics.Stopwatch.StartNew();
+        var results = ps.Invoke();
+        sw.Stop();
+
+        IReadOnlyList<object> output = results
+            .Select(o => o?.BaseObject ?? (object)string.Empty)
+            .ToList();
+        var firstError = ps.Streams.Error.FirstOrDefault()?.ToString();
+
+        if (ps.HadErrors)
+        {
+            _logger.LogWarning(
+                "PSRemote {Host}: script produced error(s): {FirstError}",
+                hostId, firstError);
+        }
+
+        return new PSResult(
+            Success:     !ps.HadErrors,
+            Output:      output,
+            ErrorRecord: firstError,
+            Elapsed:     sw.Elapsed);
+    }
+
+    private async Task<IReadOnlyList<VmSnapshot>> GetInventoryViaTransportAsync(
+        string hostId,
+        HostState state,
+        CancellationToken ct)
+    {
+        var opts = BuildTransportOptions(hostId, state);
+
+        using var session = await _psRemoteTransport.ConnectAsync(opts, ct).ConfigureAwait(false);
+        using var ps      = System.Management.Automation.PowerShell.Create();
+        ps.Runspace = session.Runspace;
+
+        _logger.LogInformation("PSRemote {Host}: running Get-VM (transport={AuthMode})",
+            hostId, session.AuthModeUsed);
+
+        ps.AddCommand("Get-VM");
+        var vms = ps.Invoke();
+
+        if (ps.HadErrors)
+        {
+            foreach (var err in ps.Streams.Error)
+                _logger.LogWarning("PSRemote {Host}: Get-VM error: {Err}", hostId, err?.ToString());
+        }
+
+        return BuildSnapshots(hostId, vms);
+    }
+
+    private PSRemoteConnectionOptions BuildTransportOptions(string hostId, HostState state)
+    {
+        if (state == HostState.DomainJoined)
+        {
+            return new PSRemoteConnectionOptions
+            {
+                Hostname   = hostId,
+                AuthMode   = PSRemoteAuthMode.Kerberos,
+            };
+        }
+
+        if (_credential.ClientCertificate is not null)
+        {
+            return new PSRemoteConnectionOptions
+            {
+                Hostname          = hostId,
+                AuthMode          = PSRemoteAuthMode.Certificate,
+                ClientCertificate = _credential.ClientCertificate,
+            };
+        }
+
+        // Auto: will pick Kerberos if USERDNSDOMAIN is set, cert if cert available,
+        // or throw if neither — PSRemoteTransport enforces no-HTTP.
+        return new PSRemoteConnectionOptions
+        {
+            Hostname          = hostId,
+            AuthMode          = PSRemoteAuthMode.Auto,
+            ClientCertificate = _credential.ClientCertificate,
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // Legacy Basic/Negotiate paths (Workgroup hosts without a client cert)
+    // Kept so that existing deployments continue to work.
+    // -------------------------------------------------------------------------
+
+    private PSResult InvokeLegacy(
+        string hostId,
+        string script,
+        IDictionary<string, object>? args)
+    {
+        using var runspace = OpenLegacyRunspace(hostId);
+        using var ps       = System.Management.Automation.PowerShell.Create();
+        ps.Runspace = runspace;
+
+        var cmd = ps.AddScript(script);
+        if (args is not null)
+        {
+            foreach (var kv in args)
+                cmd.AddParameter(kv.Key, kv.Value);
+        }
+
+        var sw      = System.Diagnostics.Stopwatch.StartNew();
+        var results = ps.Invoke();
+        sw.Stop();
+
+        IReadOnlyList<object> output = results
+            .Select(o => o?.BaseObject ?? (object)string.Empty)
+            .ToList();
+        var firstError = ps.Streams.Error.FirstOrDefault()?.ToString();
+
+        if (ps.HadErrors)
+        {
+            _logger.LogWarning(
+                "PSRemote {Host}: script produced error(s): {FirstError}",
+                hostId, firstError);
+        }
+
+        return new PSResult(
+            Success:     !ps.HadErrors,
+            Output:      output,
+            ErrorRecord: firstError,
+            Elapsed:     sw.Elapsed);
+    }
+
+    private IReadOnlyList<VmSnapshot> GetInventoryLegacy(string hostId)
+    {
+        using var runspace = OpenLegacyRunspace(hostId);
+        using var ps       = System.Management.Automation.PowerShell.Create();
+        ps.Runspace = runspace;
+
+        _logger.LogInformation("PSRemote {Host}: running Get-VM (legacy transport)", hostId);
+
+        ps.AddCommand("Get-VM");
+        var vms = ps.Invoke();
+
+        if (ps.HadErrors)
+        {
+            foreach (var err in ps.Streams.Error)
+                _logger.LogWarning("PSRemote {Host}: Get-VM error: {Err}", hostId, err?.ToString());
+        }
+
+        return BuildSnapshots(hostId, vms);
+    }
+
+    private Runspace OpenLegacyRunspace(string hostId)
     {
         var connInfo = BuildConnectionInfo(hostId, _stateTracker.GetState(hostId), _credential, _transport);
         var runspace = RunspaceFactory.CreateRunspace(connInfo);
@@ -179,9 +288,47 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
         return runspace;
     }
 
+    // -------------------------------------------------------------------------
+    // Snapshot builder (shared)
+    // -------------------------------------------------------------------------
+
+    private static IReadOnlyList<VmSnapshot> BuildSnapshots(
+        string hostId,
+        System.Collections.ObjectModel.Collection<PSObject> vms)
+    {
+        var snapshots = new List<VmSnapshot>(vms.Count);
+        var now = DateTimeOffset.UtcNow;
+
+        foreach (var vm in vms)
+        {
+            if (vm?.BaseObject is null) continue;
+
+            var name      = GetPropertyString(vm, "Name")   ?? GetPropertyString(vm, "VMName") ?? "unknown";
+            var vmGuid    = GetPropertyString(vm, "VMId")   ?? GetPropertyString(vm, "Id")     ?? Guid.NewGuid().ToString();
+            var state     = GetPropertyString(vm, "State")  ?? "unknown";
+            var cpuCount  = GetPropertyInt(vm, "ProcessorCount") ?? 0;
+            var memBytes  = GetPropertyLong(vm, "MemoryAssigned") ?? GetPropertyLong(vm, "MemoryStartup") ?? 0L;
+
+            snapshots.Add(new VmSnapshot(
+                VmId:          vmGuid,
+                Name:          name,
+                HostId:        hostId,
+                State:         state,
+                CpuCount:      cpuCount,
+                MemoryBytes:   memBytes,
+                ObservedAtUtc: now));
+        }
+
+        return snapshots;
+    }
+
+    // -------------------------------------------------------------------------
+    // Legacy WSManConnectionInfo builder — kept for backward compat and test coverage
+    // -------------------------------------------------------------------------
+
     /// <summary>
     /// Build a <see cref="WSManConnectionInfo"/> for the given host. Exposed as
-    /// <c>internal</c> so unit tests can assert the resulting scheme/port/auth/skip
+    /// <c>internal</c> so existing unit tests can assert the resulting scheme/port/auth/skip
     /// flags without standing up a runspace.
     /// </summary>
     internal static WSManConnectionInfo BuildConnectionInfo(
@@ -211,10 +358,7 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
         {
             // AB#1686 — Server 2025 NTLM hardening + PSWSMan's forked WSMan natives
             // make Negotiate-over-HTTP infeasible. Switch to HTTPS:5986 + Basic +
-            // skip-cert-validation (Ansible-on-Windows MVP pattern). Operator is
-            // responsible for provisioning the WinRM HTTPS listener (the iter
-            // playbook does this for the cluster-sim VM). Phase V will tighten
-            // with proper PKI + cert validation.
+            // skip-cert-validation (Ansible-on-Windows MVP pattern).
             var psCredential = BuildPSCredential(credential);
 
             connInfo = new WSManConnectionInfo(
@@ -241,9 +385,9 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
             connInfo.AuthenticationMechanism = AuthenticationMechanism.Negotiate;
         }
 
-        connInfo.OperationTimeout    = 60_000; // 60 s
-        connInfo.OpenTimeout         = 30_000; // 30 s
-        connInfo.MaximumReceivedDataSizePerCommand = 50 * 1024 * 1024; // 50 MB
+        connInfo.OperationTimeout                    = 60_000;
+        connInfo.OpenTimeout                         = 30_000;
+        connInfo.MaximumReceivedDataSizePerCommand    = 50 * 1024 * 1024;
 
         return connInfo;
     }
@@ -268,14 +412,14 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
     private static string NormalizeTransport(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
-            return TransportHttpsBasic; // MVP default (AB#1686)
+            return TransportHttpsBasic;
 
         var v = raw.Trim().ToLowerInvariant();
         return v switch
         {
-            TransportHttpsBasic   => TransportHttpsBasic,
+            TransportHttpsBasic    => TransportHttpsBasic,
             TransportHttpNegotiate => TransportHttpNegotiate,
-            _ => TransportHttpsBasic, // unknown → safe default
+            _                      => TransportHttpsBasic,
         };
     }
 
@@ -295,9 +439,9 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
         if (member?.Value is null) return null;
         return member.Value switch
         {
-            int i    => i,
-            long l   => (int)l,
-            _        => int.TryParse(member.Value.ToString(), out var v) ? v : null,
+            int i  => i,
+            long l => (int)l,
+            _      => int.TryParse(member.Value.ToString(), out var v) ? v : null,
         };
     }
 
@@ -307,9 +451,9 @@ public sealed class PSRemoteExecutor : IPSRemoteExecutor
         if (member?.Value is null) return null;
         return member.Value switch
         {
-            long l  => l,
-            int i   => (long)i,
-            _       => long.TryParse(member.Value.ToString(), out var v) ? v : null,
+            long l => l,
+            int i  => (long)i,
+            _      => long.TryParse(member.Value.ToString(), out var v) ? v : null,
         };
     }
 

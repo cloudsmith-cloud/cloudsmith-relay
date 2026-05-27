@@ -138,7 +138,11 @@ try
 
     // ---------------------------------------------------------------------------
     // PSRemote executor — real when RELAY_HYPER_V_HOSTS is set, stub otherwise.
+    // PSRemoteTransport (AB#1666) is always registered — it is the auth/transport
+    // abstraction that PSRemoteExecutor delegates to for Kerberos and cert paths.
     // ---------------------------------------------------------------------------
+    builder.Services.AddSingleton<PSRemoteTransport>();
+
     if (hyperVHosts.Length > 0)
     {
         builder.Services.AddSingleton(new PSRemoteCredential
