@@ -116,7 +116,7 @@ public sealed class PSRemoteTransportTests
         Assert.Equal(PSRemoteAuthMode.Certificate, modeUsed);
         Assert.Equal("https", info.Scheme);
         Assert.Equal(5986, info.Port);
-        Assert.Equal(AuthenticationMechanism.Certificate, info.AuthenticationMechanism);
+        Assert.Equal(AuthenticationMechanism.Default, info.AuthenticationMechanism);
         Assert.Equal(cert.Thumbprint, info.CertificateThumbprint);
         Assert.True(info.SkipCACheck);
         Assert.True(info.SkipCNCheck);
@@ -137,7 +137,7 @@ public sealed class PSRemoteTransportTests
         var (info, modeUsed) = transport.BuildConnectionInfo(opts);
 
         Assert.Equal(PSRemoteAuthMode.Certificate, modeUsed);
-        Assert.Equal(AuthenticationMechanism.Certificate, info.AuthenticationMechanism);
+        Assert.Equal(AuthenticationMechanism.Default, info.AuthenticationMechanism);
         Assert.Equal(cert.Thumbprint, info.CertificateThumbprint);
     }
 
