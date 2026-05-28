@@ -200,7 +200,9 @@ public sealed class PSRemoteTransport
             "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
             credential: null);
 
-        connInfo.AuthenticationMechanism = AuthenticationMechanism.Certificate;
+        // Certificate auth: set thumbprint; Default mechanism delegates to the WinRM certificate
+        // authentication subsystem when CertificateThumbprint is non-empty.
+        connInfo.AuthenticationMechanism = AuthenticationMechanism.Default;
         connInfo.CertificateThumbprint   = options.ClientCertificate!.Thumbprint;
 
         ApplyTlsValidation(connInfo, options);
