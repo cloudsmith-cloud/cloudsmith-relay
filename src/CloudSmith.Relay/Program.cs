@@ -56,12 +56,15 @@ var relayOptions = new RelayOptions
 };
 
 // ---------------------------------------------------------------------------
-// Logging — Serilog -> stdout.
+// Logging — Serilog -> stdout. AB#2357 — standardised enricher set.
 // ---------------------------------------------------------------------------
+const string LogTemplate = "[{Timestamp:HH:mm:ss} {Level:u3}] [{service}] {CorrelationId}{Message:lj}{NewLine}{Exception}";
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     .Enrich.FromLogContext()
-    .WriteTo.Console()
+    .Enrich.WithProperty("service", "cloudsmith-relay")
+    .Enrich.WithProperty("machine", Environment.MachineName)
+    .WriteTo.Console(outputTemplate: LogTemplate)
     .CreateLogger();
 
 try
