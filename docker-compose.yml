@@ -9,19 +9,35 @@ services:
     container_name: cloudsmith-relay
     restart: unless-stopped
     ports:
-      # local LAN listener for Agents
-      - "8443:8443"
+      # local LAN listener for Agents — must match RELAY_LISTEN_PORT
+      - "8080:8080"
     environment:
+      # Required: PaaS API base URL (e.g. https://api.cloudsmith.cloud)
+      CLOUDSMITH_API_URL: ${CLOUDSMITH_API_URL:-}
       RELAY_PAAS_URL: ${RELAY_PAAS_URL:?set RELAY_PAAS_URL (e.g. https://api.cloudsmith.cloud)}
+      # One-time enrollment token (required on first run; optional once identity is persisted)
       RELAY_ENROLLMENT_TOKEN: ${RELAY_ENROLLMENT_TOKEN:-}
       RELAY_DISPLAY_NAME: ${RELAY_DISPLAY_NAME:-site-relay}
       RELAY_CLUSTER_ID: ${RELAY_CLUSTER_ID:-demo}
-      RELAY_LISTEN_PORT: ${RELAY_LISTEN_PORT:-8443}
+      # LAN listen port — must match the host-side port mapping above
+      RELAY_LISTEN_PORT: ${RELAY_LISTEN_PORT:-8080}
       RELAY_IDENTITY_DIR: /var/lib/cloudsmith-relay/identity
+      # Shared secret that Agents must present during /lan/v1/agents/enroll.
+      # Defaults to a random GUID at startup if not set; set explicitly so
+      # Agents can be configured with a stable known value.
+      RELAY_AGENT_ENROLLMENT_TOKEN: ${RELAY_AGENT_ENROLLMENT_TOKEN:-}
       Logging__LogLevel__Default: Information
     volumes:
       # Persisted Relay identity (private key + identity.json) — survives restart.
       - cloudsmith-relay-identity:/var/lib/cloudsmith-relay/identity
+    healthcheck:
+      # TCP probe — confirms Kestrel is listening on RELAY_LISTEN_PORT.
+      # curl is not present in the relay image; bash TCP pseudo-device is reliable.
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/8080) 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   cloudsmith-relay-identity:
