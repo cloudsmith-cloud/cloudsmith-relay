@@ -3,8 +3,10 @@
 
 using System.Buffers;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text.Json;
 using CloudSmith.Relay.Messages;
+using CloudSmith.Relay.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -129,12 +131,52 @@ public sealed class WebSocketRelayConnection : IRelayConnection
         var ws = new ClientWebSocket();
         ws.Options.KeepAliveInterval = _opts.KeepAliveInterval;
 
-        // Identity header — PaaS uses this plus the signed handshake to authenticate.
-        // mTLS will replace this header once cert-based auth lands (AB#1666-followup).
+        // F-1 fix: challenge-response possession proof.
+        // The relay signs a random nonce with its RSA private key so the API can
+        // verify against the stored public key — the RelayId header alone is spoofable.
         ws.Options.SetRequestHeader("X-CloudSmith-RelayId", _opts.RelayId);
+        AddChallengeHeaders(ws);
 
         await ws.ConnectAsync(BuildUri(), ct).ConfigureAwait(false);
         return ws;
+    }
+
+    /// <summary>
+    /// Attach the nonce + signature headers that prove possession of the relay private key.
+    /// If no private key path is configured (e.g. first-run before enrollment completes)
+    /// the headers are omitted and the API falls back to RelayId-only auth.
+    /// </summary>
+    private void AddChallengeHeaders(ClientWebSocket ws)
+    {
+        var keyPath = _opts.PrivateKeyPath;
+        if (string.IsNullOrWhiteSpace(keyPath) || !File.Exists(keyPath))
+        {
+            _logger.LogDebug("No private key at {Path} — skipping challenge-response headers", keyPath);
+            return;
+        }
+
+        try
+        {
+            // 32-byte cryptographically random nonce, base64url-encoded.
+            var nonceBytes = RandomNumberGenerator.GetBytes(32);
+            var nonce = Convert.ToBase64String(nonceBytes)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+            var jwt = RelayJwtService.FromPrivateKeyFile(keyPath);
+            var sigBytes = jwt.Sign(System.Text.Encoding.UTF8.GetBytes(nonce));
+            var sig = Convert.ToBase64String(sigBytes)
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+            ws.Options.SetRequestHeader("X-CloudSmith-Nonce", nonce);
+            ws.Options.SetRequestHeader("X-CloudSmith-Signature", sig);
+        }
+        catch (Exception ex)
+        {
+            // Non-fatal: log and continue without the headers rather than blocking
+            // the relay from reconnecting.
+            _logger.LogWarning(ex,
+                "Failed to generate challenge-response headers — connecting without signature proof");
+        }
     }
 
     private Uri BuildUri()

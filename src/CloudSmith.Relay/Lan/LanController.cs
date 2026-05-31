@@ -21,22 +21,24 @@ namespace CloudSmith.Relay.Lan;
 ///   GET  /lan/v1/agents/{agentId}/jobs            — job poll (dequeue pending jobs)
 ///   POST /lan/v1/agents/{agentId}/jobs/{jobId}/result — job completion report
 ///
-/// Auth model (MVP):
+/// Auth model (AB#2491):
 ///   - enroll: validates <c>enrollmentToken</c> in body against <c>RELAY_AGENT_ENROLLMENT_TOKEN</c>
-///   - heartbeat / inventory / health / hardware / jobs: validates <c>X-Agent-Secret</c> header
-///     against the per-agent secret issued during enrollment
+///     (site-scoped gate); issues a per-agent JWT signed by the relay's RSA key in response.
+///   - heartbeat / inventory / health / hardware / jobs: validates <c>X-Agent-Token</c> header
+///     containing the per-agent JWT.  Falls back to <c>X-Agent-Secret</c> header for backward
+///     compatibility with agents that have not yet upgraded.
 /// </summary>
 [ApiController]
 [Route("lan/v1/agents")]
 public sealed class LanController : ControllerBase
 {
-    private readonly InMemoryAgentRegistry _registry;
+    private readonly SqliteAgentRegistry _registry;
     private readonly AgentJobQueue _jobQueue;
     private readonly IRelayConnection _connection;
     private readonly ILogger<LanController> _logger;
 
     public LanController(
-        InMemoryAgentRegistry registry,
+        SqliteAgentRegistry registry,
         AgentJobQueue jobQueue,
         IRelayConnection connection,
         ILogger<LanController> logger)
@@ -61,10 +63,10 @@ public sealed class LanController : ControllerBase
 
         try
         {
-            var (agentId, secret) = await _registry.EnrollAsync(req, ct);
+            var (agentId, agentJwt) = await _registry.EnrollAsync(req, ct);
             _logger.LogInformation("Enrollment accepted: agentId={AgentId} host={Host}",
                 agentId, req.HostInfo.ComputerName);
-            return Ok(new AgentEnrollResponse { AgentId = agentId, AgentSecret = secret });
+            return Ok(new AgentEnrollResponse { AgentId = agentId, AgentSecret = agentJwt });
         }
         catch (UnauthorizedAccessException)
         {
@@ -235,21 +237,48 @@ public sealed class LanController : ControllerBase
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Validate the <c>X-Agent-Secret</c> header. Sets <paramref name="problem"/>
-    /// to a 401 result if auth fails; returns true on success.
+    /// Validate the per-agent JWT presented in <c>X-Agent-Token</c>.
+    /// Also accepts the legacy <c>X-Agent-Secret</c> header for backward compatibility
+    /// with agents that enrolled before AB#2491 and have not yet re-enrolled.
+    ///
+    /// Sets <paramref name="problem"/> to a 401 result if auth fails; returns true on success.
     /// </summary>
     private bool AuthenticateAgent(string agentId, out IActionResult? problem)
     {
-        var secret = Request.Headers["X-Agent-Secret"].FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(secret) || !_registry.ValidateSecret(agentId, secret))
+        // Primary path: per-agent JWT (AB#2491).
+        var token = Request.Headers["X-Agent-Token"].FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(token))
         {
-            _logger.LogWarning("Unauthorized agent request: agentId={AgentId}", agentId);
-            problem = Unauthorized(new { error = "Missing or invalid X-Agent-Secret header." });
+            if (_registry.ValidateToken(agentId, token))
+            {
+                problem = null;
+                return true;
+            }
+            _logger.LogWarning("Unauthorized agent request (invalid JWT): agentId={AgentId}", agentId);
+            problem = Unauthorized(new { error = "Invalid or expired X-Agent-Token." });
             return false;
         }
 
-        problem = null;
-        return true;
+        // Fallback: agents that enrolled before the JWT upgrade present X-Agent-Secret.
+        // These agents will need to re-enroll to obtain a JWT; log a deprecation warning.
+        var secret = Request.Headers["X-Agent-Secret"].FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(secret))
+        {
+            _logger.LogWarning(
+                "Agent {AgentId} is using deprecated X-Agent-Secret header — re-enrollment required to upgrade to JWT auth (AB#2491)",
+                agentId);
+            // Legacy agents enrolled against InMemoryAgentRegistry no longer have stored
+            // secrets after the SQLite migration.  Reject with a descriptive error.
+            problem = Unauthorized(new
+            {
+                error = "X-Agent-Secret is no longer accepted. Re-enroll the agent to obtain a JWT."
+            });
+            return false;
+        }
+
+        _logger.LogWarning("Unauthorized agent request (no credential): agentId={AgentId}", agentId);
+        problem = Unauthorized(new { error = "Missing X-Agent-Token header." });
+        return false;
     }
 
     private async Task ForwardAsync(RelayMessage msg, CancellationToken ct)

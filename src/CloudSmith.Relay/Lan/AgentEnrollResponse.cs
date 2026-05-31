@@ -14,8 +14,10 @@ public sealed class AgentEnrollResponse
     public string AgentId { get; set; } = string.Empty;
 
     /// <summary>
-    /// Shared secret used by the Agent on subsequent requests.
-    /// Phase V will replace with client cert / mTLS (AB#1666-followup).
+    /// Per-agent JWT signed by the relay's RSA private key (RS256).
+    /// The agent presents this as the <c>X-Agent-Token</c> header on all subsequent
+    /// LAN requests.  The JSON property name is kept as <c>agentSecret</c> for
+    /// backward compatibility with existing agent clients.
     /// </summary>
     [JsonPropertyName("agentSecret")]
     public string AgentSecret { get; set; } = string.Empty;

@@ -6,6 +6,7 @@ using CloudSmith.Relay.Enrollment;
 using CloudSmith.Relay.Execution;
 using CloudSmith.Relay.Interfaces;
 using CloudSmith.Relay.Lan;
+using CloudSmith.Relay.Security;
 using CloudSmith.Relay.State;
 using CloudSmith.Relay.Stubs;
 using CloudSmith.Relay.Workers;
@@ -126,17 +127,40 @@ try
     builder.Services.AddSingleton<IHostStateTracker, HostStateTracker>();
 
     // ---------------------------------------------------------------------------
-    // Agent registry — real in-memory implementation backed by enrollment token.
+    // RelayJwtService — signs per-agent JWTs and challenge-response nonces.
+    // Loaded from the relay's RSA private key.  Falls back to a key-less stub
+    // before first enrollment so DI resolves without throwing.
+    // ---------------------------------------------------------------------------
+    builder.Services.AddSingleton(sp =>
+    {
+        var keyPath = Path.Combine(identityDir, "relay.key");
+        if (File.Exists(keyPath))
+        {
+            return RelayJwtService.FromPrivateKeyFile(keyPath);
+        }
+        // Pre-enrollment: no key yet — return a no-op instance backed by a
+        // freshly generated ephemeral key.  The real key will be on disk before
+        // any agent tries to enroll (enrollment completes before the LAN listener
+        // accepts connections).
+        Log.Warning("RelayJwtService: identity key not found at {Path} — using ephemeral key until enrollment completes", keyPath);
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        return RelayJwtService.FromPrivateKeyPem(rsa.ExportPkcs8PrivateKeyPem());
+    });
+
+    // ---------------------------------------------------------------------------
+    // Agent registry — SQLite-backed implementation (AB#2491 F-3/F-5 fix).
     // Registered as both the concrete type (for LanController injection) and the
     // IAgentRegistry interface (for InventoryScanWorker lookup).
     // ---------------------------------------------------------------------------
     builder.Services.AddSingleton(sp =>
-        new InMemoryAgentRegistry(
+        new SqliteAgentRegistry(
             agentEnrollmentToken,
-            sp.GetRequiredService<ILogger<InMemoryAgentRegistry>>()));
+            sp.GetRequiredService<RelayJwtService>(),
+            Path.Combine(identityDir, SqliteAgentRegistry.DefaultDbFileName),
+            sp.GetRequiredService<ILogger<SqliteAgentRegistry>>()));
 
     builder.Services.AddSingleton<IAgentRegistry>(sp =>
-        sp.GetRequiredService<InMemoryAgentRegistry>());
+        sp.GetRequiredService<SqliteAgentRegistry>());
 
     // Job queue — routes jobs from PaaS (WebSocket) to Agents (LAN poll).
     builder.Services.AddSingleton<AgentJobQueue>();
