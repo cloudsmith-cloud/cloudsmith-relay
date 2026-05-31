@@ -50,6 +50,17 @@ public sealed class RelayHostedService : BackgroundService
         _connection.OnMessageReceived += OnMessageAsync;
         await _connection.OpenAsync(ct).ConfigureAwait(false);
 
+        // Log site association status — clear signal for operators.
+        if (string.IsNullOrWhiteSpace(_opts.SiteId))
+        {
+            _logger.LogWarning(
+                "Relay running without site association — set SiteId in config to associate with a site");
+        }
+        else
+        {
+            _logger.LogInformation("Relay registered with site {SiteId}", _opts.SiteId);
+        }
+
         _logger.LogInformation(
             "Relay {RelayId} online; heartbeat every {Interval}",
             relayId, _opts.HeartbeatInterval);
@@ -66,8 +77,9 @@ public sealed class RelayHostedService : BackgroundService
                 }
                 try
                 {
-                    await _connection.SendAsync(new Heartbeat(DateTimeOffset.UtcNow), ct)
-                        .ConfigureAwait(false);
+                    await _connection.SendAsync(
+                        new Heartbeat(DateTimeOffset.UtcNow, string.IsNullOrWhiteSpace(_opts.SiteId) ? null : _opts.SiteId),
+                        ct).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -104,7 +116,7 @@ public sealed class RelayHostedService : BackgroundService
                 "No persisted Relay identity and RELAY_ENROLLMENT_TOKEN not set — cannot enroll.");
         }
 
-        var result = await _enroller.EnrollAsync(_opts.EnrollmentToken, _opts.DisplayName, ct)
+        var result = await _enroller.EnrollAsync(_opts.EnrollmentToken, _opts.DisplayName, _opts.SiteId, ct)
             .ConfigureAwait(false);
         return result.RelayId;
     }

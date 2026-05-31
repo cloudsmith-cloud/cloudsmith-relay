@@ -35,6 +35,14 @@ public sealed class RelayOptions
     public TimeSpan InventoryScanInterval { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Site identifier this Relay is associated with — RELAY_SITE_ID.
+    /// When set, the Relay includes this value in registration and heartbeat payloads
+    /// so the API can correlate relay activity back to the site.
+    /// Optional: when absent the Relay operates without site association.
+    /// </summary>
+    public string? SiteId { get; init; }
+
+    /// <summary>
     /// Hyper-V hosts to scan directly via PSRemote when no Agent is enrolled.
     /// Populated from <c>RELAY_HYPER_V_HOSTS</c> (comma-separated hostnames/IPs).
     /// Empty list = liveness-only mode (pushes empty inventory).

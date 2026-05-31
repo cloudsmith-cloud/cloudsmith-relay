@@ -26,6 +26,7 @@ var lanListenPort = int.TryParse(
 var identityDir = Environment.GetEnvironmentVariable("RELAY_IDENTITY_DIR")
     ?? RelayEnrollmentClient.DefaultIdentityDirectory;
 var clusterId = Environment.GetEnvironmentVariable("RELAY_CLUSTER_ID") ?? "demo";
+var siteId = Environment.GetEnvironmentVariable("RELAY_SITE_ID");
 
 // RELAY_AGENT_ENROLLMENT_TOKEN — shared secret Agents must present during enroll.
 // Defaults to a random value so the Relay starts safely even if not set; Agents
@@ -52,6 +53,7 @@ var relayOptions = new RelayOptions
     ListenPort        = lanListenPort,
     IdentityDirectory = identityDir,
     ClusterId         = clusterId,
+    SiteId            = siteId,
     HyperVHosts       = hyperVHosts,
 };
 

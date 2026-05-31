@@ -21,6 +21,11 @@ public interface IRelayEnrollmentClient
     /// </summary>
     /// <param name="token">One-time enrollment token from PaaS.</param>
     /// <param name="displayName">Human-readable name the Relay registers under.</param>
+    /// <param name="siteId">
+    /// Optional site identifier to associate this Relay with a CloudSmith site.
+    /// When provided, the enrollment payload includes <c>siteId</c> so PaaS can
+    /// correlate the Relay to the correct site immediately on first registration.
+    /// </param>
     /// <param name="ct">Cancellation token.</param>
-    Task<EnrollmentResult> EnrollAsync(string token, string displayName, CancellationToken ct);
+    Task<EnrollmentResult> EnrollAsync(string token, string displayName, string? siteId, CancellationToken ct);
 }

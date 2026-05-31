@@ -51,7 +51,12 @@ public sealed record HardwarePush(
     DateTimeOffset ObservedAtUtc) : RelayMessage;
 
 /// <summary>Relay -> PaaS: liveness heartbeat.</summary>
-public sealed record Heartbeat(DateTimeOffset At) : RelayMessage;
+/// <param name="At">UTC timestamp when the heartbeat was sent.</param>
+/// <param name="SiteId">
+/// Optional site identifier — echoed back on every heartbeat so PaaS can correlate
+/// relay status to the correct site even if registration state is lost.
+/// </param>
+public sealed record Heartbeat(DateTimeOffset At, string? SiteId = null) : RelayMessage;
 
 /// <summary>
 /// Async event-handler signature used by <see cref="Connection.IRelayConnection.OnMessageReceived"/>.

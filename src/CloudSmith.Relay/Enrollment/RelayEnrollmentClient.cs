@@ -50,14 +50,17 @@ public sealed class RelayEnrollmentClient(
         return JsonSerializer.Deserialize<RelayIdentity>(json, JsonOpts);
     }
 
-    public async Task<EnrollmentResult> EnrollAsync(string token, string displayName, CancellationToken ct)
+    public async Task<EnrollmentResult> EnrollAsync(string token, string displayName, string? siteId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
         ArgumentException.ThrowIfNullOrWhiteSpace(displayName);
 
         Directory.CreateDirectory(IdentityDirectory);
 
-        logger.LogInformation("Enrolling Relay '{DisplayName}' with PaaS {PaasUrl}", displayName, PaasUrl);
+        if (string.IsNullOrWhiteSpace(siteId))
+            logger.LogInformation("Enrolling Relay '{DisplayName}' with PaaS {PaasUrl} (no site association)", displayName, PaasUrl);
+        else
+            logger.LogInformation("Enrolling Relay '{DisplayName}' with PaaS {PaasUrl} for site {SiteId}", displayName, PaasUrl, siteId);
 
         // 1. Generate RSA 2048 keypair.
         using var rsa = RSA.Create(2048);
@@ -66,7 +69,7 @@ public sealed class RelayEnrollmentClient(
 
         // 2. POST enrollment.
         var endpoint = $"{PaasUrl}/api/v1/relays/enroll";
-        var request = new EnrollRequest(token, displayName, publicKeyPem);
+        var request = new EnrollRequest(token, displayName, publicKeyPem, string.IsNullOrWhiteSpace(siteId) ? null : siteId);
         using var resp = await http.PostAsJsonAsync(endpoint, request, JsonOpts, ct).ConfigureAwait(false);
 
         if (!resp.IsSuccessStatusCode)
@@ -113,7 +116,8 @@ public sealed class RelayEnrollmentClient(
     internal sealed record EnrollRequest(
         [property: JsonPropertyName("token")] string Token,
         [property: JsonPropertyName("displayName")] string DisplayName,
-        [property: JsonPropertyName("publicKeyPem")] string PublicKeyPem);
+        [property: JsonPropertyName("publicKeyPem")] string PublicKeyPem,
+        [property: JsonPropertyName("siteId")] string? SiteId = null);
 
     internal sealed record EnrollResponse(
         [property: JsonPropertyName("relayId")] string RelayId,

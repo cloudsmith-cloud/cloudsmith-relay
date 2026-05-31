@@ -53,7 +53,7 @@ public sealed class RelayEnrollmentClientTests : IDisposable
             _tmpDir);
 
         // Act
-        var result = await client.EnrollAsync("one-time-token", "test-relay", CancellationToken.None);
+        var result = await client.EnrollAsync("one-time-token", "test-relay", null, CancellationToken.None);
 
         // Assert — response parsed correctly
         Assert.Equal("relay-abc-123", result.RelayId);
@@ -99,8 +99,71 @@ public sealed class RelayEnrollmentClientTests : IDisposable
             "https://paas.example.com", _tmpDir);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => client.EnrollAsync("bad", "test", CancellationToken.None));
+            () => client.EnrollAsync("bad", "test", null, CancellationToken.None));
         Assert.Contains("400", ex.Message);
+    }
+
+    [Fact]
+    public async Task EnrollAsync_WithSiteId_IncludesSiteIdInPayload()
+    {
+        // Arrange
+        string? capturedBody = null;
+
+        var handler = new StubHandler(async (req, ct) =>
+        {
+            capturedBody = req.Content is null ? null : await req.Content.ReadAsStringAsync(ct);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    """{"relayId":"relay-site-test","paasUrl":"https://paas.example.com"}""",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        });
+        using var http = new HttpClient(handler);
+        var client = new RelayEnrollmentClient(
+            http, NullLogger<RelayEnrollmentClient>.Instance,
+            "https://paas.example.com", _tmpDir);
+
+        // Act
+        await client.EnrollAsync("enroll-tok", "test-relay", "site-abc-123", CancellationToken.None);
+
+        // Assert — siteId appears in the request body
+        Assert.NotNull(capturedBody);
+        using var doc = JsonDocument.Parse(capturedBody!);
+        Assert.Equal("site-abc-123", doc.RootElement.GetProperty("siteId").GetString());
+    }
+
+    [Fact]
+    public async Task EnrollAsync_NullSiteId_OmitsSiteIdFromPayload()
+    {
+        // Arrange
+        string? capturedBody = null;
+
+        var handler = new StubHandler(async (req, ct) =>
+        {
+            capturedBody = req.Content is null ? null : await req.Content.ReadAsStringAsync(ct);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    """{"relayId":"relay-no-site","paasUrl":"https://paas.example.com"}""",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        });
+        using var http = new HttpClient(handler);
+        var client = new RelayEnrollmentClient(
+            http, NullLogger<RelayEnrollmentClient>.Instance,
+            "https://paas.example.com", _tmpDir);
+
+        // Act
+        await client.EnrollAsync("enroll-tok", "test-relay", null, CancellationToken.None);
+
+        // Assert — siteId is absent (serialized with WhenWritingNull)
+        Assert.NotNull(capturedBody);
+        using var doc = JsonDocument.Parse(capturedBody!);
+        Assert.False(doc.RootElement.TryGetProperty("siteId", out _),
+            "siteId should be absent when not configured");
     }
 
     [Fact]
@@ -113,7 +176,7 @@ public sealed class RelayEnrollmentClientTests : IDisposable
             "https://paas.example.com", _tmpDir);
 
         await Assert.ThrowsAsync<ArgumentException>(
-            () => client.EnrollAsync("", "test", CancellationToken.None));
+            () => client.EnrollAsync("", "test", null, CancellationToken.None));
     }
 
     private sealed class StubHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> impl)
