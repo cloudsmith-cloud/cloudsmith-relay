@@ -157,7 +157,7 @@ public sealed class RelayJwtService
     private static byte[] Base64UrlDecode(string s)
     {
         var t = s.Replace('-', '+').Replace('_', '/');
-        var pad = t.Length % 4 switch { 2 => "==", 3 => "=", _ => "" };
+        var pad = (t.Length % 4) switch { 2 => "==", 3 => "=", _ => "" };
         return Convert.FromBase64String(t + pad);
     }
 }
