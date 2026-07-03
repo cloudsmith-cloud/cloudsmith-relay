@@ -279,20 +279,23 @@ public sealed class LanController : ControllerBase
             return false;
         }
 
-        // Fallback: agents that enrolled before the JWT upgrade present X-Agent-Secret.
-        // These agents will need to re-enroll to obtain a JWT; log a deprecation warning.
+        // Fallback: current agents still send the enrollment response value under
+        // X-Agent-Secret. That value is now a JWT (property name kept for wire
+        // compatibility), so validate it exactly like X-Agent-Token.
         var secret = Request.Headers["X-Agent-Secret"].FirstOrDefault();
         if (!string.IsNullOrWhiteSpace(secret))
         {
-            _logger.LogWarning(
-                "Agent {AgentId} is using deprecated X-Agent-Secret header — re-enrollment required to upgrade to JWT auth (AB#2491)",
-                agentId);
-            // Legacy agents enrolled against InMemoryAgentRegistry no longer have stored
-            // secrets after the SQLite migration.  Reject with a descriptive error.
-            problem = Unauthorized(new
+            if (_registry.ValidateToken(agentId, secret))
             {
-                error = "X-Agent-Secret is no longer accepted. Re-enroll the agent to obtain a JWT."
-            });
+                _logger.LogDebug(
+                    "Agent {AgentId} authenticated via legacy X-Agent-Secret header carrying JWT",
+                    agentId);
+                problem = null;
+                return true;
+            }
+
+            _logger.LogWarning("Unauthorized agent request (invalid legacy JWT): agentId={AgentId}", agentId);
+            problem = Unauthorized(new { error = "Invalid or expired X-Agent-Secret token." });
             return false;
         }
 
