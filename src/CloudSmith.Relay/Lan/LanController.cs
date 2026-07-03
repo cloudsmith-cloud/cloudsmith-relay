@@ -7,6 +7,7 @@ using CloudSmith.Relay.Models;
 using CloudSmith.Relay.Workers;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 
 namespace CloudSmith.Relay.Lan;
 
@@ -38,6 +39,8 @@ public sealed class LanController : ControllerBase
     private readonly IRelayConnection _connection;
     private readonly JobResultForwarder _forwarder;
     private readonly ILogger<LanController> _logger;
+    private readonly ConcurrentDictionary<string, byte> _resumeServedAgents =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public LanController(
         SqliteAgentRegistry registry,
@@ -190,8 +193,20 @@ public sealed class LanController : ControllerBase
         if (!AuthenticateAgent(agentId, out var problem))
             return problem!;
 
-        var jobs = _jobQueue.Dequeue(agentId);
-        _logger.LogDebug("Job poll: agentId={AgentId} count={Count}", agentId, jobs.Count);
+        // On the first poll seen by this relay process, resume any unfinished
+        // delivered jobs immediately. After a relay crash/restart there is no
+        // in-process execution to preserve, so waiting for redelivery grace only
+        // delays recovery of work that can be safely retried (at-least-once).
+        var isFirstPollSinceStart = _resumeServedAgents.TryAdd(agentId, 0);
+        var jobs = isFirstPollSinceStart
+            ? _jobQueue.DequeueForResume(agentId)
+            : _jobQueue.Dequeue(agentId);
+
+        _logger.LogDebug(
+            "Job poll: agentId={AgentId} count={Count} mode={Mode}",
+            agentId,
+            jobs.Count,
+            isFirstPollSinceStart ? "resume" : "normal");
         // Canonical LAN dispatch item shape (contract AB#4839 §1.4) — same fields
         // as the job.dispatch frame; the Agent parses payloadJson itself.
         return Ok(jobs.Select(j => new
