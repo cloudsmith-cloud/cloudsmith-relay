@@ -162,8 +162,12 @@ try
     builder.Services.AddSingleton<IAgentRegistry>(sp =>
         sp.GetRequiredService<SqliteAgentRegistry>());
 
-    // Job queue — routes jobs from PaaS (WebSocket) to Agents (LAN poll).
-    builder.Services.AddSingleton<AgentJobQueue>();
+    // Job queue — SQLite-persisted (AB#4840); routes jobs from PaaS (WebSocket)
+    // to Agents (LAN poll) and survives relay restarts. Shares the SQLite database
+    // file with the agent registry.
+    builder.Services.AddSingleton(sp => new AgentJobQueue(
+        Path.Combine(identityDir, SqliteAgentRegistry.DefaultDbFileName),
+        sp.GetRequiredService<ILogger<AgentJobQueue>>()));
 
     // Job dispatch handler — routes job.dispatch frames to the Agent queue or
     // the PSRemote execution path, and produces the contract job.ack (AB#2961).

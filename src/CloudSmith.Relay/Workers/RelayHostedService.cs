@@ -55,6 +55,10 @@ public sealed class RelayHostedService : BackgroundService
         _connection.OnMessageReceived += OnMessageAsync;
         await _connection.OpenAsync(ct).ConfigureAwait(false);
 
+        // Restart survival (AB#4840): re-run psremote jobs interrupted by the
+        // restart. Agent-queued jobs are served from SQLite on the next poll.
+        _dispatchHandler.ResumePsRemoteJobs();
+
         // Log site association status — clear signal for operators.
         if (string.IsNullOrWhiteSpace(_opts.SiteId))
         {

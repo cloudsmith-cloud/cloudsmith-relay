@@ -16,11 +16,23 @@ namespace CloudSmith.Relay.Tests.Execution;
 /// Tests for <see cref="JobDispatchHandler"/> — ack semantics (accepted / duplicate /
 /// rejected), agent-path enqueue, and PSRemote-path routing (AB#2961).
 /// </summary>
-public sealed class JobDispatchHandlerTests
+public sealed class JobDispatchHandlerTests : IDisposable
 {
-    private readonly AgentJobQueue _queue = new(NullLogger<AgentJobQueue>.Instance);
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"jobs-handler-test-{Guid.NewGuid():N}.db");
+
+    private readonly AgentJobQueue _queue;
     private readonly Mock<IAgentRegistry> _registry = new();
     private readonly Mock<IPSRemoteExecutor> _psRemote = new();
+
+    public JobDispatchHandlerTests()
+        => _queue = new AgentJobQueue(_dbPath, NullLogger<AgentJobQueue>.Instance);
+
+    public void Dispose()
+    {
+        _queue.Dispose();
+        if (File.Exists(_dbPath)) File.Delete(_dbPath);
+    }
 
     private JobDispatchHandler NewHandler() => new(
         _queue,

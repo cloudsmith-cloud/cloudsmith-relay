@@ -74,6 +74,44 @@ public sealed class JobDispatchHandler
         return Task.FromResult(HandleAgent(dispatch));
     }
 
+    /// <summary>
+    /// Resume PSRemote jobs that were interrupted by a relay restart (AB#4840 /
+    /// contract §6.2). Agent-queued jobs need no resume — they are served from
+    /// SQLite on the agent's next poll — but psremote jobs execute in-process,
+    /// so an undelivered/unresulted one after restart must be re-run here
+    /// (at-least-once; contract §4.4 requires re-execution-safe payloads).
+    /// </summary>
+    public void ResumePsRemoteJobs()
+    {
+        var interrupted = _queue.DequeueForResume(PsRemoteAgentId);
+        if (interrupted.Count == 0) return;
+
+        _logger.LogInformation("Resuming {Count} interrupted psremote job(s) after restart", interrupted.Count);
+        foreach (var job in interrupted)
+        {
+            var dispatch = new JobDispatch(job.JobId, job.JobType, job.PayloadJson,
+                job.IdempotencyKey, job.Traceparent);
+
+            PsRemotePayload? payload = null;
+            try
+            {
+                payload = JsonSerializer.Deserialize<PsRemotePayload>(job.PayloadJson, JsonOpts);
+            }
+            catch (JsonException) { /* handled below */ }
+
+            if (payload is null ||
+                string.IsNullOrWhiteSpace(payload.HostId) ||
+                string.IsNullOrWhiteSpace(payload.Script))
+            {
+                _logger.LogWarning("Cannot resume psremote job {JobId} — payload no longer parseable", job.JobId);
+                _queue.CompleteJob(job.JobId, succeeded: false);
+                continue;
+            }
+
+            _ = Task.Run(() => ExecutePsRemoteAsync(dispatch, payload), CancellationToken.None);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Agent path
     // ------------------------------------------------------------------
