@@ -165,6 +165,10 @@ try
     // Job queue — routes jobs from PaaS (WebSocket) to Agents (LAN poll).
     builder.Services.AddSingleton<AgentJobQueue>();
 
+    // Job dispatch handler — routes job.dispatch frames to the Agent queue or
+    // the PSRemote execution path, and produces the contract job.ack (AB#2961).
+    builder.Services.AddSingleton<JobDispatchHandler>();
+
     // ---------------------------------------------------------------------------
     // PSRemote executor — real when RELAY_HYPER_V_HOSTS is set, stub otherwise.
     // PSRemoteTransport (AB#1666) is always registered — it is the auth/transport

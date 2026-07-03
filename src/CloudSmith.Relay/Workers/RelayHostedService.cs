@@ -3,6 +3,7 @@
 
 using CloudSmith.Relay.Connection;
 using CloudSmith.Relay.Enrollment;
+using CloudSmith.Relay.Execution;
 using CloudSmith.Relay.Messages;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -14,7 +15,8 @@ namespace CloudSmith.Relay.Workers;
 /// Top-level Relay lifecycle worker:
 ///   1. Ensure the Relay has an identity (enroll if first run).
 ///   2. Open the persistent WebSocket to PaaS.
-///   3. Handle inbound JobDispatch by ACK'ing — actual dispatch wiring is AB#1666-followup.
+///   3. Route inbound job.dispatch frames through <see cref="JobDispatchHandler"/>
+///      and send the resulting job.ack upstream (AB#2961).
 ///   4. Heartbeat every <see cref="RelayOptions.HeartbeatInterval"/>.
 /// </summary>
 public sealed class RelayHostedService : BackgroundService
@@ -23,6 +25,7 @@ public sealed class RelayHostedService : BackgroundService
     private readonly IRelayEnrollmentClient _enroller;
     private readonly IRelayConnection _connection;
     private readonly RelayConnectionOptions _connOpts;
+    private readonly JobDispatchHandler _dispatchHandler;
     private readonly ILogger<RelayHostedService> _logger;
 
     public RelayHostedService(
@@ -30,12 +33,14 @@ public sealed class RelayHostedService : BackgroundService
         IRelayEnrollmentClient enroller,
         IRelayConnection connection,
         IOptions<RelayConnectionOptions> connOpts,
+        JobDispatchHandler dispatchHandler,
         ILogger<RelayHostedService> logger)
     {
         _opts = opts.Value;
         _enroller = enroller;
         _connection = connection;
         _connOpts = connOpts.Value;
+        _dispatchHandler = dispatchHandler;
         _logger = logger;
     }
 
@@ -127,18 +132,28 @@ public sealed class RelayHostedService : BackgroundService
         {
             case JobDispatch job:
                 _logger.LogInformation(
-                    "Received job {JobId} action={Action} args={ArgCount}; " +
-                    "would dispatch to Agent or PSRemote — AB#1666-followup",
-                    job.JobId, job.Action, job.Args.Count);
+                    "Received job.dispatch jobId={JobId} jobType={JobType}",
+                    job.JobId, job.JobType);
+
+                JobAck ack;
                 try
                 {
-                    await _connection.SendAsync(
-                        new JobAck(job.JobId, "Accepted", "MVP stub — execution wiring pending"),
-                        CancellationToken.None).ConfigureAwait(false);
+                    ack = await _dispatchHandler.HandleAsync(job, CancellationToken.None)
+                        .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to ACK job {JobId}", job.JobId);
+                    _logger.LogError(ex, "Dispatch handling failed for job {JobId}", job.JobId);
+                    ack = new JobAck(job.JobId, JobDispatchHandler.AckRejected, "internal error during dispatch");
+                }
+
+                try
+                {
+                    await _connection.SendAsync(ack, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to send job.ack for job {JobId}", job.JobId);
                 }
                 break;
 

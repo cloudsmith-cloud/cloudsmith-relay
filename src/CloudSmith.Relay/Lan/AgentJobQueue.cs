@@ -1,80 +1,117 @@
 // Copyright 2026 CloudSmith Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-using System.Collections.Concurrent;
+using CloudSmith.Relay.Messages;
 using CloudSmith.Relay.Models;
 using Microsoft.Extensions.Logging;
 
 namespace CloudSmith.Relay.Lan;
 
+/// <summary>Outcome of persisting a dispatched job to the local queue.</summary>
+public enum EnqueueOutcome
+{
+    /// <summary>The job was newly persisted to the queue.</summary>
+    Accepted,
+
+    /// <summary>The jobId is already known to the queue — safe re-dispatch (contract §4.2).</summary>
+    Duplicate,
+}
+
 /// <summary>
-/// Per-agent job queue. PaaS enqueues jobs via WebSocket dispatch;
-/// Agents poll via GET /lan/v1/agents/{agentId}/jobs.
+/// Per-agent job queue. PaaS dispatches jobs via the control WebSocket
+/// (<c>job.dispatch</c>); Agents poll via GET /lan/v1/agents/{agentId}/jobs.
 /// Results flow back via POST /lan/v1/agents/{agentId}/jobs/{jobId}/result.
+///
+/// Field shapes are canonical per the frozen job dispatch contract (AB#4839).
+/// The queue never fabricates results — timeout adjudication belongs to the API.
 /// </summary>
 public sealed class AgentJobQueue
 {
     private readonly ILogger<AgentJobQueue> _logger;
+    private readonly object _gate = new();
 
-    // agentId → ordered queue of pending jobs
-    private readonly ConcurrentDictionary<string, ConcurrentQueue<Job>> _queues =
-        new(StringComparer.OrdinalIgnoreCase);
+    // jobId → job record. Retained after dequeue so duplicate dispatches are detected.
+    private readonly Dictionary<Guid, QueuedJob> _jobs = new();
 
-    // jobId → TaskCompletionSource for result waiting (PaaS side)
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<JobResult>> _pending =
+    // agentId → ordered pending (undelivered) jobIds.
+    private readonly Dictionary<string, List<Guid>> _pendingByAgent =
         new(StringComparer.OrdinalIgnoreCase);
 
     public AgentJobQueue(ILogger<AgentJobQueue> logger) => _logger = logger;
 
     /// <summary>
-    /// Enqueue a job for the target agent. Called when PaaS dispatches a job via WebSocket.
-    /// Returns a Task that completes when the agent reports a result (or times out).
+    /// Persist a dispatched job for the target agent. Idempotent on jobId:
+    /// a re-dispatch of a known job returns <see cref="EnqueueOutcome.Duplicate"/>.
     /// </summary>
-    public Task<JobResult> EnqueueAsync(string agentId, Job job, TimeSpan timeout, CancellationToken ct)
+    public EnqueueOutcome Enqueue(string agentId, JobDispatch dispatch)
     {
-        var queue = _queues.GetOrAdd(agentId, _ => new ConcurrentQueue<Job>());
-        queue.Enqueue(job);
-
-        var tcs = new TaskCompletionSource<JobResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[job.JobId] = tcs;
-
-        _logger.LogInformation("Job {JobId} enqueued for agent {AgentId}", job.JobId, agentId);
-
-        // Auto-expire if agent never picks it up or reports a result.
-        _ = Task.Delay(timeout, ct).ContinueWith(t =>
+        lock (_gate)
         {
-            if (_pending.TryRemove(job.JobId, out var expiredTcs))
-                expiredTcs.TrySetResult(new JobResult(job.JobId, false, null, "Timed out", DateTimeOffset.UtcNow));
-        }, TaskScheduler.Default);
+            if (_jobs.ContainsKey(dispatch.JobId))
+            {
+                _logger.LogInformation("Duplicate dispatch for job {JobId} — already queued", dispatch.JobId);
+                return EnqueueOutcome.Duplicate;
+            }
 
-        return tcs.Task;
-    }
+            var job = new QueuedJob(
+                dispatch.JobId,
+                agentId,
+                dispatch.JobType,
+                dispatch.PayloadJson,
+                dispatch.IdempotencyKey,
+                dispatch.Traceparent);
 
-    /// <summary>
-    /// Dequeue all pending jobs for an agent. Called by Agent poll.
-    /// </summary>
-    public IReadOnlyList<Job> Dequeue(string agentId)
-    {
-        if (!_queues.TryGetValue(agentId, out var queue))
-            return Array.Empty<Job>();
+            _jobs[job.JobId] = job;
+            if (!_pendingByAgent.TryGetValue(agentId, out var pending))
+                _pendingByAgent[agentId] = pending = new List<Guid>();
+            pending.Add(job.JobId);
 
-        var jobs = new List<Job>();
-        while (queue.TryDequeue(out var job))
-            jobs.Add(job);
-        return jobs;
-    }
-
-    /// <summary>
-    /// Complete the TCS for a job when the agent reports a result.
-    /// </summary>
-    public bool CompleteJob(JobResult result)
-    {
-        if (!_pending.TryRemove(result.JobId, out var tcs))
-        {
-            _logger.LogWarning("Job result received for unknown/expired jobId={JobId}", result.JobId);
-            return false;
+            _logger.LogInformation("Job {JobId} ({JobType}) enqueued for agent {AgentId}",
+                job.JobId, job.JobType, agentId);
+            return EnqueueOutcome.Accepted;
         }
-        tcs.TrySetResult(result);
-        return true;
+    }
+
+    /// <summary>
+    /// Dequeue all pending jobs for an agent and mark them delivered. Called by Agent poll.
+    /// </summary>
+    public IReadOnlyList<QueuedJob> Dequeue(string agentId)
+    {
+        lock (_gate)
+        {
+            if (!_pendingByAgent.TryGetValue(agentId, out var pending) || pending.Count == 0)
+                return Array.Empty<QueuedJob>();
+
+            var jobs = pending.Select(id => _jobs[id]).ToList();
+            pending.Clear();
+            return jobs;
+        }
+    }
+
+    /// <summary>
+    /// Mark a job completed when the agent (or PSRemote path) reports a result.
+    /// Returns false if the jobId is unknown.
+    /// </summary>
+    public bool CompleteJob(Guid jobId, bool succeeded)
+    {
+        lock (_gate)
+        {
+            if (!_jobs.ContainsKey(jobId))
+            {
+                _logger.LogWarning("Job result received for unknown jobId={JobId}", jobId);
+                return false;
+            }
+            _logger.LogInformation("Job {JobId} completed succeeded={Succeeded}", jobId, succeeded);
+            return true;
+        }
+    }
+
+    /// <summary>Number of pending (undelivered) jobs for an agent — diagnostics/tests.</summary>
+    public int PendingCount(string agentId)
+    {
+        lock (_gate)
+        {
+            return _pendingByAgent.TryGetValue(agentId, out var pending) ? pending.Count : 0;
+        }
     }
 }

@@ -4,37 +4,20 @@
 namespace CloudSmith.Relay.Models;
 
 /// <summary>
-/// A job dispatched from PaaS to the Relay for execution against an Agent or via PSRemote.
+/// A job accepted from PaaS and queued on this Relay for delivery to an Agent
+/// (LAN poll) or the PSRemote execution path. Field shapes are canonical per
+/// the frozen job dispatch contract (AB#4839).
 /// </summary>
-/// <param name="JobId">Stable job identifier (GUID string).</param>
-/// <param name="HostId">Target host.</param>
-/// <param name="Kind">Logical job kind (e.g. "PSRemote.Invoke", "Agent.RunModule").</param>
-/// <param name="Payload">Opaque JSON payload — interpreted by the dispatch target.</param>
-public sealed record Job(
-    string JobId,
-    string HostId,
-    string Kind,
-    string Payload);
-
-/// <summary>
-/// Result of a Job, returned upstream to PaaS.
-/// </summary>
-/// <param name="JobId">Matches <see cref="Job.JobId"/>.</param>
-/// <param name="Success">True iff the job completed without terminating errors.</param>
-/// <param name="Output">Result body (JSON-encoded).</param>
-/// <param name="Error">Error detail if <see cref="Success"/> is false.</param>
-/// <param name="CompletedAtUtc">When the result was produced.</param>
-public sealed record JobResult(
-    string JobId,
-    bool Success,
-    string? Output,
-    string? Error,
-    DateTimeOffset CompletedAtUtc);
-
-/// <summary>
-/// Event args raised by <see cref="Interfaces.IRelayConnection.OnJobAssigned"/>.
-/// </summary>
-public sealed class JobAssignedEventArgs(Job job) : EventArgs
-{
-    public Job Job { get; } = job;
-}
+/// <param name="JobId">Primary key of the core.jobs row - echoed on every hop.</param>
+/// <param name="AgentId">Target agent, or the PSRemote pseudo-agent id.</param>
+/// <param name="JobType">Logical operation identifier, e.g. <c>cluster.validate-network</c>.</param>
+/// <param name="PayloadJson">Opaque JSON payload - parsed only by the executing target.</param>
+/// <param name="IdempotencyKey">Client-supplied dedupe key (nullable).</param>
+/// <param name="Traceparent">W3C trace context (nullable).</param>
+public sealed record QueuedJob(
+    Guid JobId,
+    string AgentId,
+    string JobType,
+    string PayloadJson,
+    string? IdempotencyKey,
+    string? Traceparent);

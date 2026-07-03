@@ -188,12 +188,15 @@ public sealed class LanController : ControllerBase
 
         var jobs = _jobQueue.Dequeue(agentId);
         _logger.LogDebug("Job poll: agentId={AgentId} count={Count}", agentId, jobs.Count);
+        // Canonical LAN dispatch item shape (contract AB#4839 §1.4) — same fields
+        // as the job.dispatch frame; the Agent parses payloadJson itself.
         return Ok(jobs.Select(j => new
         {
-            jobId   = j.JobId,
-            jobType = j.Kind,
-            payload = new { scriptName = j.Kind, arguments = (Dictionary<string, string>?)null },
-            traceparent = (string?)null,
+            jobId          = j.JobId,
+            jobType        = j.JobType,
+            payloadJson    = j.PayloadJson,
+            idempotencyKey = j.IdempotencyKey,
+            traceparent    = j.Traceparent,
         }));
     }
 
@@ -213,17 +216,13 @@ public sealed class LanController : ControllerBase
 
         if (req is null) return BadRequest(new { error = "Request body is required." });
 
-        var result = new JobResult(
-            jobId,
-            req.Succeeded,
-            req.Output,
-            req.Error,
-            DateTimeOffset.UtcNow);
+        if (!Guid.TryParse(jobId, out var jobGuid))
+            return BadRequest(new { error = "jobId must be a GUID." });
 
-        _jobQueue.CompleteJob(result);
+        _jobQueue.CompleteJob(jobGuid, req.Succeeded);
 
-        // Forward result to PaaS over WebSocket.
-        var ack = new JobAck(jobId, req.Succeeded ? "succeeded" : "failed", req.Error);
+        // Interim upstream signal until the canonical job.result frame lands (AB#4841).
+        var ack = new JobAck(jobGuid, req.Succeeded ? "succeeded" : "failed", req.Error);
         await ForwardAsync(ack, ct);
 
         _logger.LogInformation("Job result: agentId={AgentId} jobId={JobId} succeeded={Ok}",

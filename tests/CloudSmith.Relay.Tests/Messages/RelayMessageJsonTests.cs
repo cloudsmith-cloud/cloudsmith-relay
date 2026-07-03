@@ -27,24 +27,70 @@ public sealed class RelayMessageJsonTests
     [Fact]
     public void JobDispatch_RoundTrip()
     {
+        var jobId = Guid.Parse("d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f");
         var msg = new JobDispatch(
-            JobId: "job-1",
-            Action: "agent.runModule",
-            Args: new Dictionary<string, object>
-            {
-                ["module"] = "inventory.scan",
-                ["timeoutSec"] = 60,
-            });
+            JobId: jobId,
+            JobType: "cluster.validate-network",
+            PayloadJson: "{\"scriptName\":\"Validate-Network.ps1\"}",
+            IdempotencyKey: "op-2026-07-03-cluster01-validate",
+            Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
         var json = JsonSerializer.Serialize<RelayMessage>(msg, Opts);
 
         Assert.Contains("\"$type\":\"job.dispatch\"", json);
-        Assert.Contains("\"jobId\":\"job-1\"", json);
+        Assert.Contains("\"jobId\":\"d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f\"", json);
+        Assert.Contains("\"jobType\":\"cluster.validate-network\"", json);
+        Assert.Contains("\"payloadJson\":", json);
+        Assert.Contains("\"idempotencyKey\":", json);
+        Assert.Contains("\"traceparent\":", json);
 
         var back = JsonSerializer.Deserialize<RelayMessage>(json, Opts);
         var jd = Assert.IsType<JobDispatch>(back);
-        Assert.Equal("job-1", jd.JobId);
-        Assert.Equal("agent.runModule", jd.Action);
-        Assert.Equal(2, jd.Args.Count);
+        Assert.Equal(jobId, jd.JobId);
+        Assert.Equal("cluster.validate-network", jd.JobType);
+        Assert.Equal("{\"scriptName\":\"Validate-Network.ps1\"}", jd.PayloadJson);
+        Assert.Equal("op-2026-07-03-cluster01-validate", jd.IdempotencyKey);
+        Assert.Equal("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", jd.Traceparent);
+    }
+
+    [Fact]
+    public void JobDispatch_CanonicalContractFrame_Deserializes()
+    {
+        // Literal frame from the frozen contract doc (AB#4839 §1.1).
+        const string json = """
+            {
+              "$type": "job.dispatch",
+              "jobId": "d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f",
+              "jobType": "cluster.validate-network",
+              "payloadJson": "{\"scriptName\":\"Validate-Network.ps1\",\"arguments\":{\"ClusterName\":\"clu-01\"}}",
+              "idempotencyKey": "op-2026-07-03-cluster01-validate",
+              "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            }
+            """;
+
+        var back = JsonSerializer.Deserialize<RelayMessage>(json, Opts);
+        var jd = Assert.IsType<JobDispatch>(back);
+        Assert.Equal(Guid.Parse("d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f"), jd.JobId);
+        Assert.Equal("cluster.validate-network", jd.JobType);
+        Assert.Contains("Validate-Network.ps1", jd.PayloadJson);
+        Assert.Equal("op-2026-07-03-cluster01-validate", jd.IdempotencyKey);
+        Assert.NotNull(jd.Traceparent);
+    }
+
+    [Fact]
+    public void JobDispatch_OptionalFieldsAbsent_DeserializeAsNull()
+    {
+        const string json = """
+            {
+              "$type": "job.dispatch",
+              "jobId": "d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f",
+              "jobType": "cluster.validate-network",
+              "payloadJson": "{}"
+            }
+            """;
+
+        var jd = Assert.IsType<JobDispatch>(JsonSerializer.Deserialize<RelayMessage>(json, Opts));
+        Assert.Null(jd.IdempotencyKey);
+        Assert.Null(jd.Traceparent);
     }
 
     [Fact]
@@ -96,13 +142,28 @@ public sealed class RelayMessageJsonTests
     [Fact]
     public void JobAck_RoundTrip()
     {
-        var msg = new JobAck("job-9", "Accepted", "ok");
+        var jobId = Guid.NewGuid();
+        var msg = new JobAck(jobId, "accepted");
         var json = JsonSerializer.Serialize<RelayMessage>(msg, Opts);
 
         Assert.Contains("\"$type\":\"job.ack\"", json);
+        Assert.Contains("\"ackStatus\":\"accepted\"", json);
+
         var back = JsonSerializer.Deserialize<RelayMessage>(json, Opts);
         var ack = Assert.IsType<JobAck>(back);
-        Assert.Equal("job-9", ack.JobId);
-        Assert.Equal("Accepted", ack.Status);
+        Assert.Equal(jobId, ack.JobId);
+        Assert.Equal("accepted", ack.AckStatus);
+        Assert.Null(ack.Detail);
+    }
+
+    [Fact]
+    public void JobAck_Rejected_CarriesDetail()
+    {
+        var msg = new JobAck(Guid.NewGuid(), "rejected", "no enrolled agent available");
+        var json = JsonSerializer.Serialize<RelayMessage>(msg, Opts);
+
+        var ack = Assert.IsType<JobAck>(JsonSerializer.Deserialize<RelayMessage>(json, Opts));
+        Assert.Equal("rejected", ack.AckStatus);
+        Assert.Equal("no enrolled agent available", ack.Detail);
     }
 }
