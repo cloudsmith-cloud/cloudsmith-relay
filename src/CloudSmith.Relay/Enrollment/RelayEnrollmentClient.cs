@@ -62,10 +62,24 @@ public sealed class RelayEnrollmentClient(
         else
             logger.LogInformation("Enrolling Relay '{DisplayName}' with PaaS {PaasUrl} for site {SiteId}", displayName, PaasUrl, siteId);
 
-        // 1. Generate RSA 2048 keypair.
-        using var rsa = RSA.Create(2048);
-        var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
-        var privateKeyPem = rsa.ExportPkcs8PrivateKeyPem();
+        // 1. Load or generate the relay keypair.
+        var keyPath = Path.Combine(IdentityDirectory, PrivateKeyFile);
+        string privateKeyPem;
+        string publicKeyPem;
+
+        if (File.Exists(keyPath))
+        {
+            privateKeyPem = await File.ReadAllTextAsync(keyPath, ct).ConfigureAwait(false);
+            using var existing = RSA.Create();
+            existing.ImportFromPem(privateKeyPem);
+            publicKeyPem = existing.ExportSubjectPublicKeyInfoPem();
+        }
+        else
+        {
+            using var rsa = RSA.Create(2048);
+            publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
+            privateKeyPem = rsa.ExportPkcs8PrivateKeyPem();
+        }
 
         // 2. POST enrollment.
         var endpoint = $"{PaasUrl}/api/v1/relays/enroll";
@@ -86,7 +100,6 @@ public sealed class RelayEnrollmentClient(
             throw new InvalidOperationException("Enrollment response missing relay_id.");
 
         // 3. Persist private key + identity, chmod 600 on POSIX.
-        var keyPath = Path.Combine(IdentityDirectory, PrivateKeyFile);
         await File.WriteAllTextAsync(keyPath, privateKeyPem, ct).ConfigureAwait(false);
         TryChmod600(keyPath);
 

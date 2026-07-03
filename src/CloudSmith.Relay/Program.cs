@@ -12,6 +12,7 @@ using CloudSmith.Relay.Stubs;
 using CloudSmith.Relay.Workers;
 using Microsoft.Extensions.Options;
 using Serilog;
+using System.Security.Cryptography;
 
 // ---------------------------------------------------------------------------
 // Configuration — environment-driven (see RelayOptions for full doc).
@@ -57,6 +58,23 @@ var relayOptions = new RelayOptions
     SiteId            = siteId,
     HyperVHosts       = hyperVHosts,
 };
+
+static string EnsureRelayPrivateKeyFile(string keyPath)
+{
+    var dir = Path.GetDirectoryName(keyPath);
+    if (!string.IsNullOrWhiteSpace(dir))
+    {
+        Directory.CreateDirectory(dir);
+    }
+
+    if (!File.Exists(keyPath))
+    {
+        using var rsa = RSA.Create(2048);
+        File.WriteAllText(keyPath, rsa.ExportPkcs8PrivateKeyPem());
+    }
+
+    return keyPath;
+}
 
 // ---------------------------------------------------------------------------
 // Logging — Serilog -> stdout. AB#2357 — standardised enricher set.
@@ -134,17 +152,7 @@ try
     builder.Services.AddSingleton(sp =>
     {
         var keyPath = Path.Combine(identityDir, "relay.key");
-        if (File.Exists(keyPath))
-        {
-            return RelayJwtService.FromPrivateKeyFile(keyPath);
-        }
-        // Pre-enrollment: no key yet — return a no-op instance backed by a
-        // freshly generated ephemeral key.  The real key will be on disk before
-        // any agent tries to enroll (enrollment completes before the LAN listener
-        // accepts connections).
-        Log.Warning("RelayJwtService: identity key not found at {Path} — using ephemeral key until enrollment completes", keyPath);
-        using var rsa = System.Security.Cryptography.RSA.Create(2048);
-        return RelayJwtService.FromPrivateKeyPem(rsa.ExportPkcs8PrivateKeyPem());
+        return RelayJwtService.FromPrivateKeyFile(EnsureRelayPrivateKeyFile(keyPath));
     });
 
     // ---------------------------------------------------------------------------
