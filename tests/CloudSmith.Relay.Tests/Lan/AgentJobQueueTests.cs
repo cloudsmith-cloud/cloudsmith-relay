@@ -40,6 +40,14 @@ public sealed class AgentJobQueueTests : IDisposable
         IdempotencyKey: "op-1",
         Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
 
+    private static JobResult MakeResult(Guid jobId, bool succeeded = true) => new(
+        jobId,
+        Succeeded: succeeded,
+        ExitCode: succeeded ? 0 : -1,
+        Output: "{\"ok\":true}",
+        Error: succeeded ? null : "boom",
+        CompletedAt: new DateTimeOffset(2026, 7, 3, 14, 21, 7, TimeSpan.Zero));
+
     // ------------------------------------------------------------------
 
     [Fact]
@@ -148,15 +156,71 @@ public sealed class AgentJobQueueTests : IDisposable
         queue.Enqueue("agent-1", dispatch);
         queue.Dequeue("agent-1");
 
-        Assert.True(queue.CompleteJob(dispatch.JobId, succeeded: true));
+        Assert.True(queue.CompleteJob(MakeResult(dispatch.JobId)));
         Assert.Empty(queue.Dequeue("agent-1"));
     }
 
     [Fact]
-    public void CompleteJob_UnknownJobId_ReturnsFalse()
+    public void CompleteJob_DuplicateResult_IsNoOp()
     {
         var queue = NewQueue();
-        Assert.False(queue.CompleteJob(Guid.NewGuid(), succeeded: true));
+        var dispatch = MakeDispatch();
+        queue.Enqueue("agent-1", dispatch);
+
+        Assert.True(queue.CompleteJob(MakeResult(dispatch.JobId)));
+        Assert.False(queue.CompleteJob(MakeResult(dispatch.JobId, succeeded: false)));
+
+        // First result wins — idempotent on jobId (contract §4.3).
+        var stored = Assert.Single(queue.GetUnforwardedResults());
+        Assert.True(stored.Succeeded);
+    }
+
+    [Fact]
+    public void CompleteJob_PersistsUnforwardedResult_WithCanonicalFields()
+    {
+        var queue = NewQueue();
+        var dispatch = MakeDispatch();
+        queue.Enqueue("agent-1", dispatch);
+
+        var result = MakeResult(dispatch.JobId, succeeded: false);
+        queue.CompleteJob(result);
+
+        var stored = Assert.Single(queue.GetUnforwardedResults());
+        Assert.Equal(result.JobId, stored.JobId);
+        Assert.False(stored.Succeeded);
+        Assert.Equal(-1, stored.ExitCode);
+        Assert.Equal(result.Output, stored.Output);
+        Assert.Equal("boom", stored.Error);
+        Assert.Equal(result.CompletedAt, stored.CompletedAt);
+    }
+
+    [Fact]
+    public void Restart_UnforwardedResults_Survive()
+    {
+        var dispatch = MakeDispatch();
+
+        var first = NewQueue();
+        first.Enqueue("agent-1", dispatch);
+        first.Dequeue("agent-1");
+        first.CompleteJob(MakeResult(dispatch.JobId));
+        first.Dispose(); // crash before the WS forward happened
+
+        var second = NewQueue();
+        var pending = Assert.Single(second.GetUnforwardedResults());
+        Assert.Equal(dispatch.JobId, pending.JobId);
+    }
+
+    [Fact]
+    public void MarkResultForwarded_RemovesFromUnforwardedSet()
+    {
+        var queue = NewQueue();
+        var dispatch = MakeDispatch();
+        queue.Enqueue("agent-1", dispatch);
+        queue.CompleteJob(MakeResult(dispatch.JobId));
+
+        queue.MarkResultForwarded(dispatch.JobId);
+
+        Assert.Empty(queue.GetUnforwardedResults());
     }
 
     [Fact]

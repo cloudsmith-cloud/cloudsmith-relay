@@ -48,6 +48,16 @@ public enum EnqueueOutcome
 ///   delivered_at    TEXT NULL,
 ///   completed_at    TEXT NULL
 /// )
+/// job_results(
+///   job_id       TEXT PRIMARY KEY,      -- idempotent on jobId (contract §4.3)
+///   succeeded    INTEGER NOT NULL,
+///   exit_code    INTEGER NOT NULL,
+///   output       TEXT NOT NULL,
+///   error        TEXT NULL,
+///   completed_at TEXT NOT NULL,
+///   forwarded    INTEGER NOT NULL,      -- 0 until the job.result frame reaches PaaS
+///   received_at  TEXT NOT NULL
+/// )
 /// </code>
 /// </summary>
 public sealed class AgentJobQueue : IDisposable
@@ -104,6 +114,17 @@ public sealed class AgentJobQueue : IDisposable
                 completed_at    TEXT    NULL
             );
             CREATE INDEX IF NOT EXISTS ix_jobs_agent_status ON jobs(agent_id, status);
+            CREATE TABLE IF NOT EXISTS job_results (
+                job_id       TEXT    NOT NULL PRIMARY KEY,
+                succeeded    INTEGER NOT NULL,
+                exit_code    INTEGER NOT NULL,
+                output       TEXT    NOT NULL,
+                error        TEXT    NULL,
+                completed_at TEXT    NOT NULL,
+                forwarded    INTEGER NOT NULL DEFAULT 0,
+                received_at  TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_job_results_forwarded ON job_results(forwarded);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -179,7 +200,7 @@ public sealed class AgentJobQueue : IDisposable
                       SELECT job_id, agent_id, job_type, payload_json, idempotency_key, traceparent
                       FROM jobs
                       WHERE agent_id = @agentId AND status IN ('pending', 'delivered')
-                      ORDER BY enqueued_at;
+                      ORDER BY enqueued_at, rowid;
                       """
                     : """
                       SELECT job_id, agent_id, job_type, payload_json, idempotency_key, traceparent
@@ -187,7 +208,7 @@ public sealed class AgentJobQueue : IDisposable
                       WHERE agent_id = @agentId
                         AND (status = 'pending'
                              OR (status = 'delivered' AND delivered_at < @staleBefore))
-                      ORDER BY enqueued_at;
+                      ORDER BY enqueued_at, rowid;
                       """;
                 cmd.Parameters.AddWithValue("@agentId", agentId);
                 if (!ignoreRedeliveryGrace)
@@ -225,29 +246,98 @@ public sealed class AgentJobQueue : IDisposable
     }
 
     /// <summary>
-    /// Mark a job completed when the agent (or PSRemote path) reports a result.
-    /// Returns false if the jobId is unknown or already completed.
+    /// Record a job result and mark the job completed. The result is durably
+    /// persisted (forwarded = 0) so it survives a relay restart and is replayed
+    /// upstream on reconnect (AB#4841 / contract §6.2). Idempotent on jobId —
+    /// a second result for the same job is a no-op and returns false.
+    /// Returns true if the result was newly recorded.
     /// </summary>
-    public bool CompleteJob(Guid jobId, bool succeeded)
+    public bool CompleteJob(JobResult result)
+    {
+        lock (_gate)
+        {
+            var now = DateTimeOffset.UtcNow.ToString("O");
+
+            using (var insert = _db.CreateCommand())
+            {
+                insert.CommandText = """
+                    INSERT INTO job_results (job_id, succeeded, exit_code, output, error,
+                                             completed_at, forwarded, received_at)
+                    VALUES (@jobId, @succeeded, @exitCode, @output, @error, @completedAt, 0, @now)
+                    ON CONFLICT(job_id) DO NOTHING;
+                    """;
+                insert.Parameters.AddWithValue("@jobId", result.JobId.ToString("D"));
+                insert.Parameters.AddWithValue("@succeeded", result.Succeeded ? 1 : 0);
+                insert.Parameters.AddWithValue("@exitCode", result.ExitCode);
+                insert.Parameters.AddWithValue("@output", result.Output);
+                insert.Parameters.AddWithValue("@error", (object?)result.Error ?? DBNull.Value);
+                insert.Parameters.AddWithValue("@completedAt", result.CompletedAt.ToString("O"));
+                insert.Parameters.AddWithValue("@now", now);
+
+                if (insert.ExecuteNonQuery() == 0)
+                {
+                    _logger.LogInformation("Duplicate result for job {JobId} — already recorded", result.JobId);
+                    return false;
+                }
+            }
+
+            using (var update = _db.CreateCommand())
+            {
+                update.CommandText = """
+                    UPDATE jobs SET status = 'completed', completed_at = @now
+                    WHERE job_id = @jobId AND status <> 'completed';
+                    """;
+                update.Parameters.AddWithValue("@now", now);
+                update.Parameters.AddWithValue("@jobId", result.JobId.ToString("D"));
+                if (update.ExecuteNonQuery() == 0)
+                    _logger.LogWarning("Result recorded for job {JobId} not present in the jobs table", result.JobId);
+            }
+
+            _logger.LogInformation("Job {JobId} completed succeeded={Succeeded}; result queued for upstream forward",
+                result.JobId, result.Succeeded);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Results not yet confirmed sent to PaaS, oldest first. Replayed by the
+    /// forwarder whenever the WebSocket is (re)connected.
+    /// </summary>
+    public IReadOnlyList<JobResult> GetUnforwardedResults()
     {
         lock (_gate)
         {
             using var cmd = _db.CreateCommand();
             cmd.CommandText = """
-                UPDATE jobs SET status = 'completed', completed_at = @now
-                WHERE job_id = @jobId AND status <> 'completed';
+                SELECT job_id, succeeded, exit_code, output, error, completed_at
+                FROM job_results WHERE forwarded = 0 ORDER BY received_at, rowid;
                 """;
-            cmd.Parameters.AddWithValue("@now", DateTimeOffset.UtcNow.ToString("O"));
-            cmd.Parameters.AddWithValue("@jobId", jobId.ToString("D"));
 
-            if (cmd.ExecuteNonQuery() == 0)
+            var results = new List<JobResult>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
             {
-                _logger.LogWarning("Job result received for unknown/already-completed jobId={JobId}", jobId);
-                return false;
+                results.Add(new JobResult(
+                    JobId:       Guid.Parse(reader.GetString(0)),
+                    Succeeded:   reader.GetInt32(1) != 0,
+                    ExitCode:    reader.GetInt32(2),
+                    Output:      reader.GetString(3),
+                    Error:       reader.IsDBNull(4) ? null : reader.GetString(4),
+                    CompletedAt: DateTimeOffset.Parse(reader.GetString(5))));
             }
+            return results;
+        }
+    }
 
-            _logger.LogInformation("Job {JobId} completed succeeded={Succeeded}", jobId, succeeded);
-            return true;
+    /// <summary>Mark a result as successfully forwarded to PaaS.</summary>
+    public void MarkResultForwarded(Guid jobId)
+    {
+        lock (_gate)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = "UPDATE job_results SET forwarded = 1 WHERE job_id = @jobId";
+            cmd.Parameters.AddWithValue("@jobId", jobId.ToString("D"));
+            cmd.ExecuteNonQuery();
         }
     }
 

@@ -104,7 +104,10 @@ public sealed class JobDispatchHandler
                 string.IsNullOrWhiteSpace(payload.Script))
             {
                 _logger.LogWarning("Cannot resume psremote job {JobId} — payload no longer parseable", job.JobId);
-                _queue.CompleteJob(job.JobId, succeeded: false);
+                _queue.CompleteJob(new JobResult(
+                    job.JobId, Succeeded: false, ExitCode: -1, Output: string.Empty,
+                    Error: "psremote payload no longer parseable after relay restart",
+                    CompletedAt: DateTimeOffset.UtcNow));
                 continue;
             }
 
@@ -189,12 +192,37 @@ public sealed class JobDispatchHandler
 
             _logger.LogInformation("PSRemote job {JobId} on {HostId} finished success={Success}",
                 dispatch.JobId, payload.HostId, result.Success);
-            _queue.CompleteJob(dispatch.JobId, result.Success);
+
+            // Contract §1.3: succeeded is authoritative; -1 exitCode for
+            // infrastructure failures (PSRemote has no process exit code).
+            _queue.CompleteJob(new JobResult(
+                dispatch.JobId,
+                Succeeded: result.Success,
+                ExitCode: result.Success ? 0 : -1,
+                Output: SerializeOutput(result.Output),
+                Error: result.ErrorRecord,
+                CompletedAt: DateTimeOffset.UtcNow));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "PSRemote job {JobId} on {HostId} threw", dispatch.JobId, payload.HostId);
-            _queue.CompleteJob(dispatch.JobId, succeeded: false);
+            _queue.CompleteJob(new JobResult(
+                dispatch.JobId, Succeeded: false, ExitCode: -1, Output: string.Empty,
+                Error: ex.Message, CompletedAt: DateTimeOffset.UtcNow));
+        }
+    }
+
+    private static string SerializeOutput(IReadOnlyList<object>? output)
+    {
+        if (output is null || output.Count == 0) return string.Empty;
+        try
+        {
+            return JsonSerializer.Serialize(output, JsonOpts);
+        }
+        catch (Exception)
+        {
+            // PSObjects may not be JSON-serializable — fall back to text lines.
+            return string.Join(Environment.NewLine, output.Select(o => o?.ToString()));
         }
     }
 }

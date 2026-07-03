@@ -12,4 +12,10 @@ public sealed class AgentJobResultRequest
     [JsonPropertyName("exitCode")] public int   ExitCode  { get; set; }
     [JsonPropertyName("output")]   public string? Output   { get; set; }
     [JsonPropertyName("error")]    public string? Error    { get; set; }
+
+    /// <summary>
+    /// Stamped by the Agent at actual completion time and preserved across report
+    /// retries (contract §6.3). Falls back to relay receipt time when absent.
+    /// </summary>
+    [JsonPropertyName("completedAt")] public DateTimeOffset? CompletedAt { get; set; }
 }

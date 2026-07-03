@@ -166,4 +166,53 @@ public sealed class RelayMessageJsonTests
         Assert.Equal("rejected", ack.AckStatus);
         Assert.Equal("no enrolled agent available", ack.Detail);
     }
+
+    [Fact]
+    public void JobResult_RoundTrip()
+    {
+        var jobId = Guid.Parse("d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f");
+        var completedAt = new DateTimeOffset(2026, 7, 3, 14, 21, 7, 123, TimeSpan.Zero);
+        var msg = new JobResult(jobId, Succeeded: true, ExitCode: 0,
+            Output: "\u2026final stdout\u2026", Error: null, CompletedAt: completedAt);
+        var json = JsonSerializer.Serialize<RelayMessage>(msg, Opts);
+
+        Assert.Contains("\"$type\":\"job.result\"", json);
+        Assert.Contains("\"jobId\":\"d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f\"", json);
+        Assert.Contains("\"succeeded\":true", json);
+        Assert.Contains("\"exitCode\":0", json);
+        Assert.Contains("\"completedAt\":", json);
+
+        var back = JsonSerializer.Deserialize<RelayMessage>(json, Opts);
+        var jr = Assert.IsType<JobResult>(back);
+        Assert.Equal(jobId, jr.JobId);
+        Assert.True(jr.Succeeded);
+        Assert.Equal(0, jr.ExitCode);
+        Assert.Equal(msg.Output, jr.Output);
+        Assert.Null(jr.Error);
+        Assert.Equal(completedAt, jr.CompletedAt);
+    }
+
+    [Fact]
+    public void JobResult_CanonicalContractFrame_Deserializes()
+    {
+        // Literal frame from the frozen contract doc (AB#4839 §1.3).
+        const string json = """
+            {
+              "$type": "job.result",
+              "jobId": "d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f",
+              "succeeded": true,
+              "exitCode": 0,
+              "output": "…final stdout / result JSON…",
+              "error": null,
+              "completedAt": "2026-07-03T14:21:07.123456+00:00"
+            }
+            """;
+
+        var jr = Assert.IsType<JobResult>(JsonSerializer.Deserialize<RelayMessage>(json, Opts));
+        Assert.Equal(Guid.Parse("d3b07384-d9a0-4c9e-8f6e-1a2b3c4d5e6f"), jr.JobId);
+        Assert.True(jr.Succeeded);
+        Assert.Equal(0, jr.ExitCode);
+        Assert.Null(jr.Error);
+        Assert.Equal(new DateTimeOffset(2026, 7, 3, 14, 21, 7, TimeSpan.Zero).AddTicks(1234560), jr.CompletedAt);
+    }
 }

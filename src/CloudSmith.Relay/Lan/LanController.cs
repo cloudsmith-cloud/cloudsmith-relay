@@ -4,6 +4,7 @@
 using CloudSmith.Relay.Connection;
 using CloudSmith.Relay.Messages;
 using CloudSmith.Relay.Models;
+using CloudSmith.Relay.Workers;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 
@@ -35,17 +36,20 @@ public sealed class LanController : ControllerBase
     private readonly SqliteAgentRegistry _registry;
     private readonly AgentJobQueue _jobQueue;
     private readonly IRelayConnection _connection;
+    private readonly JobResultForwarder _forwarder;
     private readonly ILogger<LanController> _logger;
 
     public LanController(
         SqliteAgentRegistry registry,
         AgentJobQueue jobQueue,
         IRelayConnection connection,
+        JobResultForwarder forwarder,
         ILogger<LanController> logger)
     {
         _registry = registry;
         _jobQueue = jobQueue;
         _connection = connection;
+        _forwarder = forwarder;
         _logger = logger;
     }
 
@@ -219,11 +223,28 @@ public sealed class LanController : ControllerBase
         if (!Guid.TryParse(jobId, out var jobGuid))
             return BadRequest(new { error = "jobId must be a GUID." });
 
-        _jobQueue.CompleteJob(jobGuid, req.Succeeded);
+        // Durably persist the result first (forwarded = 0) — it survives a relay
+        // restart and a disconnected control WebSocket (AB#4841 / contract §6.2).
+        var result = new JobResult(
+            jobGuid,
+            req.Succeeded,
+            req.ExitCode,
+            req.Output ?? string.Empty,
+            req.Error,
+            req.CompletedAt ?? DateTimeOffset.UtcNow);
 
-        // Interim upstream signal until the canonical job.result frame lands (AB#4841).
-        var ack = new JobAck(jobGuid, req.Succeeded ? "succeeded" : "failed", req.Error);
-        await ForwardAsync(ack, ct);
+        _jobQueue.CompleteJob(result);
+
+        // Best-effort immediate forward; the background sweep replays queued
+        // results after reconnect if the WebSocket is currently down.
+        try
+        {
+            await _forwarder.TryForwardPendingAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Immediate job.result forward failed — background sweep will retry");
+        }
 
         _logger.LogInformation("Job result: agentId={AgentId} jobId={JobId} succeeded={Ok}",
             agentId, jobId, req.Succeeded);

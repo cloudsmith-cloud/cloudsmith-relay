@@ -12,6 +12,7 @@ namespace CloudSmith.Relay.Messages;
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "$type")]
 [JsonDerivedType(typeof(JobDispatch), typeDiscriminator: "job.dispatch")]
 [JsonDerivedType(typeof(JobAck), typeDiscriminator: "job.ack")]
+[JsonDerivedType(typeof(JobResult), typeDiscriminator: "job.result")]
 [JsonDerivedType(typeof(InventoryPush), typeDiscriminator: "inventory.push")]
 [JsonDerivedType(typeof(HealthProbePush), typeDiscriminator: "health.push")]
 [JsonDerivedType(typeof(HardwarePush), typeDiscriminator: "hardware.push")]
@@ -48,6 +49,26 @@ public sealed record JobAck(
     Guid JobId,
     string AckStatus,
     string? Detail = null) : RelayMessage;
+
+/// <summary>
+/// Relay -> PaaS: forward a job result reported by an Agent (LAN result POST) or
+/// produced by the PSRemote execution path. Canonical shape per the frozen job
+/// dispatch contract (AB#4839 §1.3). Forwarding is at-least-once — the API side
+/// is idempotent on jobId, so replays after reconnect are safe.
+/// </summary>
+/// <param name="JobId">Echoes the dispatch.</param>
+/// <param name="Succeeded">Authoritative success flag (<c>exitCode == 0</c> for script jobs).</param>
+/// <param name="ExitCode">Process exit code; <c>-1</c> for infrastructure failures.</param>
+/// <param name="Output">Stdout / structured result body. May be empty, never null.</param>
+/// <param name="Error">Stderr or exception message when <paramref name="Succeeded"/> is false.</param>
+/// <param name="CompletedAt">Stamped by the executor at completion time.</param>
+public sealed record JobResult(
+    Guid JobId,
+    bool Succeeded,
+    int ExitCode,
+    string Output,
+    string? Error,
+    DateTimeOffset CompletedAt) : RelayMessage;
 
 /// <summary>Relay -> PaaS: bulk inventory push for a managed cluster.</summary>
 public sealed record InventoryPush(
