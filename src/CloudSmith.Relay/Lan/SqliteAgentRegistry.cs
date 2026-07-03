@@ -129,27 +129,64 @@ public sealed class SqliteAgentRegistry : IAgentRegistry, IDisposable
             throw new UnauthorizedAccessException("Invalid enrollment token.");
         }
 
-        var agentId = Guid.NewGuid().ToString("N");
+        var host = req.HostInfo.ComputerName?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(host))
+            throw new ArgumentException("hostInfo.computerName is required.", nameof(req));
+
         var now = DateTimeOffset.UtcNow;
         var nowIso = now.ToString("O");
 
-        // Upsert by hostname so re-enrollment on the same host reuses a stable id
-        // when the agent has lost its token (e.g. host reimaged).
-        // On conflict we update last_seen_at only; agent_id stays stable.
-        using var cmd = _db.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO agents (agent_id, host_id, hostname, enrolled_at, last_seen_at)
-            VALUES (@agentId, @hostId, @hostname, @now, @now)
-            ON CONFLICT(agent_id) DO UPDATE SET last_seen_at = excluded.last_seen_at;
-            """;
-        cmd.Parameters.AddWithValue("@agentId", agentId);
-        cmd.Parameters.AddWithValue("@hostId", req.HostInfo.ComputerName);
-        cmd.Parameters.AddWithValue("@hostname", req.HostInfo.ComputerName);
-        cmd.Parameters.AddWithValue("@now", nowIso);
-        cmd.ExecuteNonQuery();
+        string? agentId = null;
+
+        // Re-enrollment must keep the existing agent_id for the same host so
+        // queued jobs already targeted to that agent are still deliverable.
+        using (var find = _db.CreateCommand())
+        {
+            find.CommandText = """
+                SELECT agent_id
+                FROM agents
+                WHERE lower(host_id) = lower(@hostId)
+                ORDER BY enrolled_at
+                LIMIT 1;
+                """;
+            find.Parameters.AddWithValue("@hostId", host);
+            agentId = find.ExecuteScalar() as string;
+        }
+
+        if (!string.IsNullOrWhiteSpace(agentId))
+        {
+            using var update = _db.CreateCommand();
+            update.CommandText = """
+                UPDATE agents
+                SET host_id = @hostId,
+                    hostname = @hostname,
+                    last_seen_at = @now
+                WHERE agent_id = @agentId;
+                """;
+            update.Parameters.AddWithValue("@hostId", host);
+            update.Parameters.AddWithValue("@hostname", host);
+            update.Parameters.AddWithValue("@now", nowIso);
+            update.Parameters.AddWithValue("@agentId", agentId);
+            update.ExecuteNonQuery();
+        }
+        else
+        {
+            agentId = Guid.NewGuid().ToString("N");
+
+            using var insert = _db.CreateCommand();
+            insert.CommandText = """
+                INSERT INTO agents (agent_id, host_id, hostname, enrolled_at, last_seen_at)
+                VALUES (@agentId, @hostId, @hostname, @now, @now);
+                """;
+            insert.Parameters.AddWithValue("@agentId", agentId);
+            insert.Parameters.AddWithValue("@hostId", host);
+            insert.Parameters.AddWithValue("@hostname", host);
+            insert.Parameters.AddWithValue("@now", nowIso);
+            insert.ExecuteNonQuery();
+        }
 
         var token = _jwt.IssueToken(agentId, siteId: null);
-        _logger.LogInformation("Agent enrolled: agentId={AgentId} host={Host}", agentId, req.HostInfo.ComputerName);
+        _logger.LogInformation("Agent enrolled: agentId={AgentId} host={Host}", agentId, host);
         return Task.FromResult((agentId, token));
     }
 

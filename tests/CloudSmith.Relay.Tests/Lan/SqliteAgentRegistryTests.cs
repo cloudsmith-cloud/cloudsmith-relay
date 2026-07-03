@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using CloudSmith.Relay.Lan;
+using CloudSmith.Relay.Messages;
 using CloudSmith.Relay.Security;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -160,5 +161,41 @@ public sealed class SqliteAgentRegistryTests : IDisposable
 
         Assert.NotNull(agent);
         Assert.Equal(agentId, agent!.AgentId);
+    }
+
+    [Fact]
+    public async Task EnrollAsync_SameHost_ReusesExistingAgentId()
+    {
+        var first = await _registry.EnrollAsync(MakeRequest(), CancellationToken.None);
+        var second = await _registry.EnrollAsync(MakeRequest(), CancellationToken.None);
+
+        Assert.Equal(first.AgentId, second.AgentId);
+        Assert.True(_registry.ValidateToken(first.AgentId, second.AgentJwt));
+
+        var agents = _registry.ListAgents().ToList();
+        Assert.Single(agents);
+        Assert.Equal(first.AgentId, agents[0].AgentId);
+    }
+
+    [Fact]
+    public async Task EnrollAsync_SameHost_KeepsQueuedJobsAddressableAfterReEnroll()
+    {
+        var (agentId, _) = await _registry.EnrollAsync(MakeRequest(), CancellationToken.None);
+        using var queue = new AgentJobQueue(_dbPath, NullLogger<AgentJobQueue>.Instance);
+
+        var dispatch = new JobDispatch(
+            Guid.NewGuid(),
+            "reference.echo",
+            "{\"message\":\"hello\"}",
+            IdempotencyKey: "ab4845",
+            Traceparent: null);
+
+        queue.Enqueue(agentId, dispatch);
+
+        var reenrolled = await _registry.EnrollAsync(MakeRequest(), CancellationToken.None);
+        Assert.Equal(agentId, reenrolled.AgentId);
+
+        var dequeued = queue.DequeueForResume(reenrolled.AgentId);
+        Assert.Equal(dispatch.JobId, Assert.Single(dequeued).JobId);
     }
 }
