@@ -248,4 +248,47 @@ public sealed class AgentJobQueueTests : IDisposable
         Assert.Single(queue.Dequeue("agent-1"));
         Assert.Single(queue.Dequeue("agent-2"));
     }
+
+    [Fact]
+    public void ReassignUndeliveredJobs_MovesPendingAndDeliveredJobsToActiveAgent()
+    {
+        var queue = NewQueue(redeliveryGrace: TimeSpan.FromMinutes(5));
+
+        var pending = MakeDispatch();
+        var delivered = MakeDispatch();
+        var completed = MakeDispatch();
+
+        queue.Enqueue("agent-pending", pending);
+        queue.Enqueue("agent-delivered", delivered);
+        queue.Enqueue("agent-completed", completed);
+
+        // Create one delivered and one completed row before reassignment.
+        Assert.Single(queue.Dequeue("agent-delivered"));
+        Assert.Single(queue.Dequeue("agent-completed"));
+        Assert.True(queue.CompleteJob(MakeResult(completed.JobId)));
+
+        var moved = queue.ReassignUndeliveredJobs("agent-active");
+        Assert.Equal(2, moved);
+
+        var recovered = queue.DequeueForResume("agent-active");
+        var ids = recovered.Select(j => j.JobId).ToHashSet();
+        Assert.Contains(pending.JobId, ids);
+        Assert.Contains(delivered.JobId, ids);
+        Assert.DoesNotContain(completed.JobId, ids);
+    }
+
+    [Fact]
+    public void ReassignUndeliveredJobs_DoesNotMoveCompletedJobs()
+    {
+        var queue = NewQueue();
+        var dispatch = MakeDispatch();
+
+        queue.Enqueue("agent-stale", dispatch);
+        queue.DequeueForResume("agent-stale");
+        Assert.True(queue.CompleteJob(MakeResult(dispatch.JobId)));
+
+        var moved = queue.ReassignUndeliveredJobs("agent-active");
+        Assert.Equal(0, moved);
+        Assert.Empty(queue.DequeueForResume("agent-active"));
+    }
 }

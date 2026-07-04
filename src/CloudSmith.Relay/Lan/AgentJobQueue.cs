@@ -354,5 +354,31 @@ public sealed class AgentJobQueue : IDisposable
         }
     }
 
+    /// <summary>
+    /// Recovery helper for relay restart windows: reassign undelivered work from
+    /// any other agent id to <paramref name="agentId"/> and mark it pending so
+    /// the caller can immediately serve it on the next dequeue.
+    ///
+    /// This is intentionally conservative at call sites (single-agent restart
+    /// recovery) and is not used as a general balancing strategy.
+    /// </summary>
+    public int ReassignUndeliveredJobs(string agentId)
+    {
+        lock (_gate)
+        {
+            using var cmd = _db.CreateCommand();
+            cmd.CommandText = """
+                UPDATE jobs
+                SET agent_id = @agentId,
+                    status = 'pending',
+                    delivered_at = NULL
+                WHERE agent_id <> @agentId
+                  AND status IN ('pending', 'delivered');
+                """;
+            cmd.Parameters.AddWithValue("@agentId", agentId);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
     public void Dispose() => _db.Dispose();
 }

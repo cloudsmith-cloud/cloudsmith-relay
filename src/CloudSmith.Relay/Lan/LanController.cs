@@ -202,6 +202,27 @@ public sealed class LanController : ControllerBase
             ? _jobQueue.DequeueForResume(agentId)
             : _jobQueue.Dequeue(agentId);
 
+        // Relay-restart recovery: if the first authenticated poll from the only
+        // enrolled agent finds nothing, reclaim undelivered work that may still
+        // be keyed to a stale agent id and serve it immediately.
+        if (isFirstPollSinceStart && jobs.Count == 0)
+        {
+            var agents = _registry.ListAgents().ToList();
+            if (agents.Count == 1 &&
+                string.Equals(agents[0].AgentId, agentId, StringComparison.OrdinalIgnoreCase))
+            {
+                var moved = _jobQueue.ReassignUndeliveredJobs(agentId);
+                if (moved > 0)
+                {
+                    _logger.LogInformation(
+                        "Recovered {Count} stranded queued job(s) for agent {AgentId} after relay restart",
+                        moved,
+                        agentId);
+                    jobs = _jobQueue.DequeueForResume(agentId);
+                }
+            }
+        }
+
         _logger.LogDebug(
             "Job poll: agentId={AgentId} count={Count} mode={Mode}",
             agentId,
