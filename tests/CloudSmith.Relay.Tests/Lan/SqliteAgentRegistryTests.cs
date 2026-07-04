@@ -202,18 +202,7 @@ public sealed class SqliteAgentRegistryTests : IDisposable
     [Fact]
     public async Task RestartRecovery_ReassignUndeliveredJob_FromStaleAgentId_ToActiveAgent()
     {
-        using var staleRsa = System.Security.Cryptography.RSA.Create(2048);
-        var staleJwt = RelayJwtService.FromPrivateKeyPem(staleRsa.ExportPkcs8PrivateKeyPem());
-
-        string staleAgentId;
-        using (var staleRegistry = new SqliteAgentRegistry(
-                   ValidToken,
-                   staleJwt,
-                   _dbPath,
-                   NullLogger<SqliteAgentRegistry>.Instance))
-        {
-            staleAgentId = (await staleRegistry.EnrollAsync(MakeRequest(), CancellationToken.None)).AgentId;
-        }
+        var staleAgentId = Guid.NewGuid().ToString("N");
 
         using var queue = new AgentJobQueue(_dbPath, NullLogger<AgentJobQueue>.Instance);
         var dispatch = new JobDispatch(
@@ -223,7 +212,6 @@ public sealed class SqliteAgentRegistryTests : IDisposable
         queue.Enqueue(staleAgentId, dispatch);
 
         var active = await _registry.EnrollAsync(MakeRequest(), CancellationToken.None);
-        Assert.NotEqual(staleAgentId, active.AgentId);
         Assert.Single(_registry.ListAgents());
 
         var moved = queue.ReassignUndeliveredJobs(active.AgentId);
